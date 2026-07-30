@@ -196,6 +196,44 @@ pub fn import_history(
     Ok(())
 }
 
+/// The log's most recent `/who` lines, one per player (last sighting wins),
+/// in original order. Tailing starts at the log's end, so without this every
+/// client restart forgets who is what class until the next in-game /who —
+/// the meter's class-gradient bars all fall back to grey. Who lines are pure
+/// metadata (classes/levels, no combat), so re-parsing them is safe; only
+/// the tail of the file is scanned.
+fn who_seed(log_path: &str) -> Vec<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const SCAN_BYTES: u64 = 4 * 1024 * 1024;
+    let Ok(mut f) = std::fs::File::open(log_path) else {
+        return Vec::new();
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(SCAN_BYTES);
+    if f.seek(SeekFrom::Start(start)).is_err() {
+        return Vec::new();
+    }
+    let mut buf = Vec::with_capacity((len - start) as usize);
+    if f.read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut latest: std::collections::HashMap<String, (usize, String)> =
+        std::collections::HashMap::new();
+    for (i, line) in text.lines().enumerate() {
+        if line.len() <= froklog::patterns::TS_LEN {
+            continue;
+        }
+        let body = &line[froklog::patterns::TS_LEN..];
+        if let Some(caps) = froklog::patterns::RE_WHO.captures(body) {
+            latest.insert(caps["name"].to_string(), (i, line.to_string()));
+        }
+    }
+    let mut rows: Vec<(usize, String)> = latest.into_values().collect();
+    rows.sort_unstable_by_key(|(i, _)| *i);
+    rows.into_iter().map(|(_, l)| l).collect()
+}
+
 /// Start tailing one character's log and pushing its events.
 ///
 /// Tailing starts at the END of the file: replaying a whole log on every
@@ -224,6 +262,12 @@ pub fn start(
 
     let (line_tx, line_rx) = crossbeam_channel::unbounded::<String>();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
+
+    // Class knowledge first, before any live line: the parser reads the
+    // channel in order, so seeded /who lines are processed ahead of combat.
+    for line in who_seed(&ch.log_path) {
+        let _ = line_tx.send(line);
+    }
 
     // tailer: file -> lines
     {
