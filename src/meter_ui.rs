@@ -265,7 +265,19 @@ pub fn draw(
                         .size(fs - 1.0)
                         .color(dim_col),
                 );
-                ui.label(RichText::new(&row.name).size(fs).color(name_col));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = fs * 0.3;
+                    ui.label(RichText::new(&row.name).size(fs).color(name_col));
+                    if let Some(owner) = &row.owner {
+                        // Pet row: name its owner, like the web viewer's
+                        // "Pet · Owner" chip.
+                        ui.label(
+                            RichText::new(format!("({owner})"))
+                                .size(fs - 3.0)
+                                .color(dim_col),
+                        );
+                    }
+                });
                 for val in [fmt_k(row.total), fmt_k(row.rate)] {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.set_min_width(num_w);

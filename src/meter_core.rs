@@ -73,6 +73,9 @@ pub struct RowData {
     /// gradient — same idea as the web viewer's multi-class row bars.
     /// Falls back to `[color]` when classes are unknown.
     pub colors: Vec<(u8, u8, u8)>,
+    /// The owning player, when this row is a pet whose owner the parser
+    /// has associated (warder possessive, Burnout correlation).
+    pub owner: Option<String>,
     pub total: u64,
     pub rate: u64,
 }
@@ -238,6 +241,7 @@ fn build_rows(
                 name: name.clone(),
                 color: class_color(code),
                 colors,
+                owner: cs.known_pets.get(name).cloned(),
                 total,
                 rate,
             }
@@ -408,6 +412,7 @@ mod tests {
                     name: "Zari".into(),
                     color: (0, 0, 0),
                     colors: vec![(0, 0, 0)],
+                    owner: None,
                     total: 7000,
                     rate: 350,
                 },
@@ -415,6 +420,7 @@ mod tests {
                     name: "Zary".into(),
                     color: (0, 0, 0),
                     colors: vec![(0, 0, 0)],
+                    owner: None,
                     total: 3000,
                     rate: 150,
                 },
