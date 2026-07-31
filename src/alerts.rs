@@ -151,7 +151,11 @@ impl Alerts {
     /// Feed one log line through the engine.
     pub fn process_line(&self, line: &str) {
         if self.enabled {
-            self.engine.process_line(line);
+            // Live lines carry the "[Thu Jul 31 ...] " timestamp and the
+            // engine matches raw text — without stripping it here, every
+            // start-anchored (^) pattern the builder generates would test
+            // fine and then never fire once in real play.
+            self.engine.process_line(builder::strip_timestamp(line));
         }
     }
 

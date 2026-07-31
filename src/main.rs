@@ -244,6 +244,9 @@ struct App {
     /// a log line being turned into a pattern, and which of its words vary
     builder_line: String,
     builder_chosen: std::collections::BTreeSet<usize>,
+    /// the pattern as shown — user-editable; regenerated on word clicks
+    builder_pattern: String,
+    builder_pattern_auto: String,
     new_name: String,
     new_sound: String,
     new_say: String,
@@ -1332,12 +1335,25 @@ impl eframe::App for App {
                         }
                     });
 
-                    let pattern = alerts::builder::regex(&tokens, &self.builder_chosen);
+                    // The generated pattern is a starting point, not gospel:
+                    // the field is editable, so "any line ending (Critical)"
+                    // is one edit away from the over-literal auto version.
+                    // Clicking words regenerates; manual edits stick until
+                    // the next click.
+                    let auto = alerts::builder::regex(&tokens, &self.builder_chosen);
+                    if auto != self.builder_pattern_auto {
+                        self.builder_pattern_auto = auto.clone();
+                        self.builder_pattern = auto;
+                    }
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("pattern").weak().small());
-                        ui.label(egui::RichText::new(&pattern).monospace().small());
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.builder_pattern)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(340.0),
+                        );
                         if ui.small_button("copy").clicked() {
-                            ui.output_mut(|o| o.copied_text = pattern.clone());
+                            ui.output_mut(|o| o.copied_text = self.builder_pattern.clone());
                             self.status = "pattern copied".into();
                         }
                     });
@@ -1410,7 +1426,7 @@ impl eframe::App for App {
                         {
                             self.alerts.add_trigger(
                                 self.new_name.trim(),
-                                &pattern,
+                                self.builder_pattern.trim(),
                                 &self.new_sound,
                                 self.new_say.trim(),
                             );
@@ -1419,14 +1435,73 @@ impl eframe::App for App {
                             self.new_say.clear();
                             self.builder_chosen.clear();
                             self.builder_line.clear();
+                            self.builder_pattern.clear();
+                            self.builder_pattern_auto.clear();
                         }
                         if ui
                             .button("Try it")
-                            .on_hover_text("Run this exact line through the triggers you have")
+                            .on_hover_text(
+                                "Test the DRAFT above against this line — plays the \
+                                 sound and speaks the text with captures filled in, \
+                                 without saving anything",
+                            )
                             .clicked()
                         {
-                            self.alerts.test_line(&self.builder_line);
-                            self.status = "line sent through the engine".into();
+                            let line =
+                                alerts::builder::strip_timestamp(&self.builder_line).to_string();
+                            match regex::Regex::new(&self.builder_pattern) {
+                                Err(e) => {
+                                    self.status = format!("pattern is not valid regex: {e}")
+                                }
+                                Ok(re) => match re.captures(&line) {
+                                    None => {
+                                        self.status =
+                                            "pattern does NOT match this line".into();
+                                    }
+                                    Some(caps) => {
+                                        let mut said = self.new_say.trim().to_string();
+                                        for i in 1..caps.len() {
+                                            said = said.replace(
+                                                &format!("{{{i}}}"),
+                                                caps.get(i).map(|m| m.as_str()).unwrap_or(""),
+                                            );
+                                        }
+                                        if !self.new_sound.is_empty() {
+                                            alerts::play_forced(
+                                                &self.new_sound,
+                                                &self.reg.settings.sound_package,
+                                            );
+                                        }
+                                        if !said.is_empty() {
+                                            let voice = alerts::Voice::from_settings(
+                                                &self.reg.settings.voice_engine,
+                                                &self.reg.settings.piper_model,
+                                            );
+                                            alerts::speak_forced(
+                                                &said,
+                                                &froklog::triggers::engine::VoicePriority::Emergency,
+                                                &voice,
+                                            );
+                                        }
+                                        let capture_note = if caps.len() > 1 {
+                                            let vals: Vec<String> = (1..caps.len())
+                                                .map(|i| {
+                                                    format!(
+                                                        "{{{i}}}={}",
+                                                        caps.get(i)
+                                                            .map(|m| m.as_str())
+                                                            .unwrap_or("")
+                                                    )
+                                                })
+                                                .collect();
+                                            format!(" — {}", vals.join(", "))
+                                        } else {
+                                            String::new()
+                                        };
+                                        self.status = format!("MATCH{capture_note}");
+                                    }
+                                },
+                            }
                         }
                     });
                 }
@@ -2384,6 +2459,8 @@ fn main() -> eframe::Result<()> {
         pron: alerts::pronunciations(),
         builder_line: String::new(),
         builder_chosen: Default::default(),
+        builder_pattern: String::new(),
+        builder_pattern_auto: String::new(),
         new_name: String::new(),
         new_sound: "Ding".into(),
         new_say: String::new(),
