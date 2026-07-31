@@ -147,6 +147,31 @@ pub struct Settings {
     /// focused. Empty = follow the focused monitor.
     #[serde(default)]
     pub meter_output: String,
+    /// Show the trigger message overlay — fly-in announcement plus history.
+    #[serde(default)]
+    pub msg_enabled: bool,
+    #[serde(default)]
+    pub msg_locked: bool,
+    #[serde(default = "default_msg_pos")]
+    pub msg_x: i32,
+    #[serde(default = "default_msg_pos")]
+    pub msg_y: i32,
+    #[serde(default = "default_msg_width")]
+    pub msg_width: u32,
+    /// Which monitor, as the compositor's connector name. Empty = focused.
+    #[serde(default)]
+    pub msg_output: String,
+    /// Font size an announcement grows to.
+    #[serde(default = "default_msg_peak")]
+    pub msg_peak_size: f32,
+    /// Seconds an announcement stays at full size.
+    #[serde(default = "default_msg_hold")]
+    pub msg_hold_secs: f32,
+    #[serde(default = "default_msg_rows")]
+    pub msg_history_rows: usize,
+    /// Hide the window this long after the last message. 0 = never hide.
+    #[serde(default = "default_msg_idle")]
+    pub msg_idle_secs: u64,
     /// Random key stamped on every stream this install registers, linking
     /// them as one household on the server — powers the viewer's "another
     /// character is live" hint. Generated once, never shown, never secret
@@ -186,6 +211,25 @@ fn default_meter_idle() -> u64 {
 }
 fn default_meter_font() -> f32 {
     14.0
+}
+
+fn default_msg_pos() -> i32 {
+    360
+}
+fn default_msg_width() -> u32 {
+    460
+}
+fn default_msg_peak() -> f32 {
+    34.0
+}
+fn default_msg_hold() -> f32 {
+    2.5
+}
+fn default_msg_rows() -> usize {
+    8
+}
+fn default_msg_idle() -> u64 {
+    8
 }
 
 fn default_sound_package() -> String {
@@ -230,6 +274,16 @@ impl Default for Settings {
             meter_idle_secs: default_meter_idle(),
             meter_font_size: default_meter_font(),
             meter_output: String::new(),
+            msg_enabled: false,
+            msg_locked: false,
+            msg_x: default_msg_pos(),
+            msg_y: default_msg_pos(),
+            msg_width: default_msg_width(),
+            msg_output: String::new(),
+            msg_peak_size: default_msg_peak(),
+            msg_hold_secs: default_msg_hold(),
+            msg_history_rows: default_msg_rows(),
+            msg_idle_secs: default_msg_idle(),
             owner_key: String::new(),
         }
     }

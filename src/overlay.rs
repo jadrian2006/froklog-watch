@@ -14,7 +14,7 @@
 //! remainder of the surface never blocks game clicks either way. Keyboard
 //! interactivity is `None` always: the game never loses keys to the meter.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc};
 use std::time::{Duration, Instant};
 
@@ -34,10 +34,24 @@ pub struct Feed {
     pub reset: Arc<AtomicBool>,
 }
 
+/// Which overlay a surface is. Both are layer surfaces that render egui and
+/// drag by their top strip; only the contents and the hide rule differ, so
+/// they share this whole host rather than duplicating the parts that were
+/// hard to get right (GPU init ordering, drag anchoring, input regions).
+#[derive(Clone, Copy, PartialEq)]
+pub enum Kind {
+    Meter,
+    Messages,
+}
+
 /// Messages from the main app into the overlay's event loop.
 pub enum OverlayMsg {
     /// Render pacing — sent by the internal ticker thread.
     Tick,
+    /// A trigger fired with something to announce (Messages surface).
+    Announce(Box<crate::messages::Msg>),
+    /// Look and pacing of the message overlay.
+    SetMessageStyle(crate::messages::MessageStyle),
     /// The set of running characters changed.
     Feeds(Vec<Feed>),
     SetLocked(bool),
@@ -92,6 +106,7 @@ pub fn preflight_instance() -> Arc<egui_wgpu::wgpu::Instance> {
 }
 
 pub struct OverlaySpawn {
+    pub kind: Kind,
     pub instance: Arc<egui_wgpu::wgpu::Instance>,
     /// Compositor connector name to spawn on ("DP-1"); empty = focused
     /// monitor. Changing monitors is a respawn, not a runtime move — layer
@@ -105,6 +120,8 @@ pub struct OverlaySpawn {
     pub max_rows: usize,
     pub font_size: f32,
     pub idle_secs: u64,
+    /// Only read when `kind` is `Messages`.
+    pub msg_style: crate::messages::MessageStyle,
 }
 
 /// Pick the feed to display: the character whose combat state saw a mob most
@@ -233,6 +250,17 @@ impl Gpu {
 }
 
 struct App {
+    kind: Kind,
+    /// The message overlay's state — queue, what is flying, what has been.
+    msgs: crate::messages::Messages,
+    /// Whether the last frame had anything to show. The meter decides that
+    /// from its own idle timer; the message overlay owns its retention rule
+    /// (`Messages::tick`), so it reports back through here instead.
+    showing: bool,
+    /// Render pacing, shared with the ticker thread. An animating message
+    /// needs ~60 Hz; a resting overlay does not, and burning the GPU behind
+    /// a full-screen game is exactly what an overlay must not do.
+    tick_ms: Arc<AtomicU64>,
     instance: Arc<egui_wgpu::wgpu::Instance>,
     feeds: Vec<Feed>,
     view: MeterView,
@@ -326,9 +354,25 @@ impl App {
         if self.preview {
             return false;
         }
-        match self.last_content {
-            None => true,
-            Some(t) => self.idle_secs > 0 && t.elapsed().as_secs() > self.idle_secs,
+        match self.kind {
+            // Retention is the message overlay's own business: it keeps the
+            // list up for a while after the last arrival and then gives the
+            // screen back.
+            Kind::Messages => !self.showing,
+            Kind::Meter => match self.last_content {
+                None => true,
+                Some(t) => self.idle_secs > 0 && t.elapsed().as_secs() > self.idle_secs,
+            },
+        }
+    }
+
+    /// Height of the grab strip. The meter reserves its title bar so the rows
+    /// underneath stay clickable; the message overlay has nothing to click,
+    /// so all of it drags.
+    fn strip_height(&self) -> f32 {
+        match self.kind {
+            Kind::Meter => self.style.font_size * 1.6 + 14.0,
+            Kind::Messages => self.height as f32,
         }
     }
 
@@ -360,6 +404,54 @@ impl App {
         if self.gpu.is_none() {
             return;
         }
+        match self.kind {
+            Kind::Meter => self.render_meter(ev),
+            Kind::Messages => self.render_messages(ev),
+        }
+    }
+
+    /// The message overlay's frame: advance the lifecycle, paint the banner
+    /// and the history, and speed the ticker up while something is moving.
+    fn render_messages(&mut self, ev: &WindowState<()>) {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(self.width as f32, self.height as f32),
+            )),
+            time: Some(self.started.elapsed().as_secs_f64()),
+            events: std::mem::take(&mut self.events),
+            ..Default::default()
+        };
+
+        let mut showing = false;
+        let msgs = &mut self.msgs;
+        let locked = self.locked;
+        let full = self.egui.run(raw, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none())
+                .show(ctx, |ui| {
+                    let panel = egui::Frame::none()
+                        .fill(egui::Color32::from_rgba_unmultiplied(10, 10, 16, 208))
+                        .rounding(8.0)
+                        .inner_margin(8.0);
+                    let r = panel.show(ui, |ui| {
+                        ui.set_width(ui.available_width() - 16.0);
+                        showing = msgs.draw(ui, locked);
+                    });
+                    ui.data_mut(|d| {
+                        d.insert_temp(egui::Id::new("panel-h"), r.response.rect.height())
+                    });
+                });
+        });
+        self.showing = showing;
+        // 60 Hz only while a message is actually flying — the rest of the
+        // time this window is a static list and 5 Hz is plenty.
+        self.tick_ms
+            .store(if self.msgs.animating() { 16 } else { 200 }, Ordering::Relaxed);
+        self.finish_frame(ev, full);
+    }
+
+    fn render_meter(&mut self, ev: &WindowState<()>) {
         // With no pipelines at all, preview still needs a surface to drag —
         // feed the UI an empty state.
         let empty_feed;
@@ -450,6 +542,12 @@ impl App {
             }
         }
 
+        self.finish_frame(ev, full);
+    }
+
+    /// Present whatever egui just produced: nothing at all when hidden, the
+    /// tessellated frame otherwise, with the input region hugging the panel.
+    fn finish_frame(&mut self, ev: &WindowState<()>, full: egui::FullOutput) {
         if self.hidden() {
             // Paint nothing — but STILL apply the texture deltas: egui
             // tracks what it has already uploaded, and dropping the initial
@@ -562,13 +660,17 @@ pub fn spawn(init: OverlaySpawn) -> OverlayHandle {
     let (tx, rx) = layershellev::calloop::channel::channel::<OverlayMsg>();
     let (out_tx, out_rx) = std_mpsc::channel::<OverlayEvent>();
 
-    // Render pacing: 5 Hz keeps timers/rows fresh without burning GPU.
+    // Render pacing: 5 Hz keeps timers/rows fresh without burning GPU. The
+    // message overlay raises this to 60 Hz while a message is in flight and
+    // drops it straight back.
+    let tick_ms = Arc::new(AtomicU64::new(200));
     {
         let tx = tx.clone();
+        let tick_ms = Arc::clone(&tick_ms);
         std::thread::Builder::new()
             .name("meter-tick".into())
             .spawn(move || loop {
-                std::thread::sleep(Duration::from_millis(200));
+                std::thread::sleep(Duration::from_millis(tick_ms.load(Ordering::Relaxed).max(8)));
                 if tx.send(OverlayMsg::Tick).is_err() {
                     break;
                 }
@@ -583,7 +685,7 @@ pub fn spawn(init: OverlaySpawn) -> OverlayHandle {
             // A panic anywhere in the loop must still tell the main app the
             // overlay is gone, or the meter silently stops existing.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run(init, rx, out_for_thread.clone())
+                run(init, rx, out_for_thread.clone(), tick_ms)
             }))
             .unwrap_or_else(|p| {
                 let msg = p
@@ -604,9 +706,19 @@ fn run(
     init: OverlaySpawn,
     rx: layershellev::calloop::channel::Channel<OverlayMsg>,
     out: std_mpsc::Sender<OverlayEvent>,
+    tick_ms: Arc<AtomicU64>,
 ) -> Result<(), String> {
-    let height = surface_height(init.max_rows, init.font_size);
-    let mut builder = WindowState::new("froklog-meter")
+    let mut msgs = crate::messages::Messages::default();
+    msgs.style = init.msg_style;
+    let height = match init.kind {
+        Kind::Meter => surface_height(init.max_rows, init.font_size),
+        Kind::Messages => msgs.surface_height(),
+    };
+    let name = match init.kind {
+        Kind::Meter => "froklog-meter",
+        Kind::Messages => "froklog-messages",
+    };
+    let mut builder = WindowState::new(name)
         .with_size((init.width, height))
         .with_layer(Layer::Overlay)
         .with_anchor(Anchor::Top | Anchor::Left)
@@ -622,7 +734,12 @@ fn run(
         .build()
         .map_err(|e| format!("layer-shell unavailable: {e}"))?;
 
+    msgs.style = init.msg_style;
     let mut app = App {
+        kind: init.kind,
+        msgs,
+        showing: false,
+        tick_ms,
         instance: init.instance,
         feeds: init.feeds,
         view: MeterView::default(),
@@ -782,7 +899,7 @@ fn run(
                         let pressed = matches!(state, WEnum::Value(ButtonState::Pressed));
                         // The title strip (panel margin + tab row) is the
                         // drag handle, like the Windows meter's caption.
-                        let strip_h = app.style.font_size * 1.6 + 14.0;
+                        let strip_h = app.strip_height();
                         if pressed && !app.locked && app.pointer.y <= strip_h {
                             app.drag_press = Some(app.pointer);
                             app.drag_origin = (app.x, app.y);
@@ -836,6 +953,22 @@ fn run(
                     }
                     app.render(ev);
                 }
+                OverlayMsg::Announce(msg) => {
+                    app.msgs.push(*msg);
+                    // Straight to the screen: waiting for the next tick would
+                    // put up to a fifth of a second between the sound and the
+                    // words, which is exactly the gap that reads as lag.
+                    app.render(ev);
+                }
+                OverlayMsg::SetMessageStyle(style) => {
+                    app.msgs.style = style;
+                    let h = app.msgs.surface_height();
+                    if h != app.height {
+                        app.height = h;
+                        ev.main_window().set_size((app.width, h));
+                    }
+                    app.render(ev);
+                }
                 OverlayMsg::Feeds(feeds) => app.feeds = feeds,
                 OverlayMsg::SetLocked(locked) => {
                     app.locked = locked;
@@ -860,6 +993,7 @@ fn run(
                 }
                 OverlayMsg::Preview(on) => {
                     app.preview = on;
+                    app.msgs.preview = on;
                     app.render(ev);
                 }
                 OverlayMsg::SetSize(w, h) => {

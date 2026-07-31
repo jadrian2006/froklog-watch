@@ -42,6 +42,15 @@ pub struct Fired {
     pub played: Option<String>,
 }
 
+/// An existing trigger taken back apart into the fields the builder edits.
+pub struct Parts {
+    pub name: String,
+    pub pattern: String,
+    pub sound: String,
+    pub say: String,
+    pub show: String,
+}
+
 pub struct Alerts {
     engine: TriggerEngine,
     queue: Arc<Mutex<Vec<OverlayEvent>>>,
@@ -105,9 +114,15 @@ impl Alerts {
     /// the honest per-trigger test. (No fake line can match an arbitrary
     /// pattern, so the actions are executed directly; unfilled `{n}` capture
     /// placeholders in spoken text become the word "something".)
-    pub fn fire_trigger_actions(&self, index: usize, package: &str, voice: &Voice) {
+    pub fn fire_trigger_actions(
+        &self,
+        index: usize,
+        package: &str,
+        voice: &Voice,
+    ) -> Vec<crate::messages::Msg> {
+        let mut shown = Vec::new();
         let Some(t) = self.cfg.triggers.get(index) else {
-            return;
+            return shown;
         };
         for action in &t.actions {
             match action {
@@ -126,10 +141,47 @@ impl Alerts {
                     }
                     speak_forced(&said, priority, voice);
                 }
-                // Overlay/StoreVar have nothing audible to prove — skip.
-                Action::Overlay { .. } | Action::StoreVar { .. } => {}
+                Action::Overlay { message, .. } => {
+                    // Same placeholder substitution as the spoken text: a
+                    // test has no captures to fill in.
+                    let mut text = message.clone();
+                    while let Some(a) = text.find('{') {
+                        match text[a..].find('}') {
+                            Some(rel) => text.replace_range(a..a + rel + 1, "something"),
+                            None => break,
+                        }
+                    }
+                    let mut ev = action.clone();
+                    if let Action::Overlay { message, .. } = &mut ev {
+                        *message = text;
+                    }
+                    if let Action::Overlay {
+                        icon,
+                        color,
+                        message,
+                        message_color,
+                        border_color,
+                        treatment,
+                        priority,
+                        ..
+                    } = ev
+                    {
+                        shown.push(crate::messages::Msg {
+                            icon,
+                            color,
+                            text: message,
+                            text_color: message_color,
+                            border_color,
+                            treatment,
+                            priority,
+                        });
+                    }
+                }
+                // Nothing to prove for a variable write.
+                Action::StoreVar { .. } => {}
             }
         }
+        shown
     }
 
     /// Remove a trigger permanently — written to triggers.toml and the
@@ -145,7 +197,14 @@ impl Alerts {
 
     /// Append a new trigger and write it to the same file the Windows client
     /// reads, so anything built here is portable back to it.
-    pub fn add_trigger(&mut self, name: &str, pattern: &str, sound: &str, say: &str) {
+    pub fn add_trigger(
+        &mut self,
+        name: &str,
+        pattern: &str,
+        sound: &str,
+        say: &str,
+        show: &str,
+    ) {
         let mut actions = Vec::new();
         if !sound.is_empty() {
             actions.push(Action::PlaySound {
@@ -158,6 +217,9 @@ impl Alerts {
                 tts_text: say.to_string(),
                 priority: VoicePriority::default(),
             });
+        }
+        if !show.is_empty() {
+            actions.push(overlay_action(show));
         }
         self.cfg.triggers.push(TriggerDef {
             name: name.to_string(),
@@ -173,13 +235,33 @@ impl Alerts {
         self.engine.reload(&self.cfg);
     }
 
+}
+
+/// The overlay action the builder writes. Icon and colours are left at their
+/// defaults — the message overlay picks an accent from the icon key, and a
+/// hand-edited triggers.toml can set anything richer.
+fn overlay_action(message: &str) -> Action {
+    Action::Overlay {
+        icon: String::new(),
+        color: String::new(),
+        message: message.to_string(),
+        message_color: String::new(),
+        border_color: String::new(),
+        delay_secs: 0.0,
+        treatment: Default::default(),
+        priority: VoicePriority::default(),
+    }
+}
+
+impl Alerts {
     /// Pull an existing trigger back apart into the four fields the builder
     /// edits — name, pattern, sound label, spoken text. A trigger written by
     /// hand can hold more than that (several conditions, overlay actions), so
-    /// only the first match condition and the first sound/voice action come
-    /// back; `parts` returning None means "too rich for the builder, use the
-    /// text editor" rather than silently dropping the rest on save.
-    pub fn parts(&self, index: usize) -> Option<(String, String, String, String)> {
+    /// only the first match condition and the first sound/voice/overlay
+    /// action come back; `parts` returning None means "too rich for the
+    /// builder, use the text editor" rather than silently dropping the rest
+    /// on save.
+    pub fn parts(&self, index: usize) -> Option<Parts> {
         let t = self.cfg.triggers.get(index)?;
         if t.conditions.len() > 1 {
             return None;
@@ -193,23 +275,38 @@ impl Alerts {
         };
         let mut sound = String::new();
         let mut say = String::new();
+        let mut show = String::new();
         for a in &t.actions {
             match a {
                 Action::PlaySound { sound: Some(s), .. } if sound.is_empty() => {
                     sound = s.clone()
                 }
                 Action::VoiceAlert { tts_text, .. } if say.is_empty() => say = tts_text.clone(),
-                Action::PlaySound { .. } | Action::VoiceAlert { .. } => return None,
-                Action::Overlay { .. } | Action::StoreVar { .. } => return None,
+                Action::Overlay { message, .. } if show.is_empty() => show = message.clone(),
+                _ => return None,
             }
         }
-        Some((t.name.clone(), pattern, sound, say))
+        Some(Parts {
+            name: t.name.clone(),
+            pattern,
+            sound,
+            say,
+            show,
+        })
     }
 
     /// Replace a trigger in place. Keeps its position in the list and its
     /// enabled state, so editing a live trigger does not silently re-enable
     /// one that was ticked off, and preserves the voice priority already set.
-    pub fn update_trigger(&mut self, index: usize, name: &str, pattern: &str, sound: &str, say: &str) {
+    pub fn update_trigger(
+        &mut self,
+        index: usize,
+        name: &str,
+        pattern: &str,
+        sound: &str,
+        say: &str,
+        show: &str,
+    ) {
         let Some(old) = self.cfg.triggers.get(index) else {
             return;
         };
@@ -221,6 +318,13 @@ impl Alerts {
                 _ => None,
             })
             .unwrap_or_default();
+        // Keep whatever the overlay action already said beyond its text:
+        // icon, colours and treatment are only settable by hand-editing, and
+        // an edit through the builder must not quietly discard them.
+        let kept_overlay = old.actions.iter().find_map(|a| match a {
+            Action::Overlay { .. } => Some(a.clone()),
+            _ => None,
+        });
         let mut actions = Vec::new();
         if !sound.is_empty() {
             actions.push(Action::PlaySound {
@@ -232,6 +336,30 @@ impl Alerts {
             actions.push(Action::VoiceAlert {
                 tts_text: say.to_string(),
                 priority,
+            });
+        }
+        if !show.is_empty() {
+            actions.push(match kept_overlay {
+                Some(Action::Overlay {
+                    icon,
+                    color,
+                    message_color,
+                    border_color,
+                    delay_secs,
+                    treatment,
+                    priority,
+                    ..
+                }) => Action::Overlay {
+                    icon,
+                    color,
+                    message: show.to_string(),
+                    message_color,
+                    border_color,
+                    delay_secs,
+                    treatment,
+                    priority,
+                },
+                _ => overlay_action(show),
             });
         }
         let t = &mut self.cfg.triggers[index];
@@ -275,16 +403,20 @@ impl Alerts {
 
     /// Fire whatever the engine has queued. Called on the UI tick, which also
     /// drives the engine's own delayed actions.
-    pub fn pump(&mut self, package: &str, voice: &Voice) {
+    pub fn pump(&mut self, package: &str, voice: &Voice) -> Vec<crate::messages::Msg> {
         self.engine.tick();
         let events: Vec<OverlayEvent> = {
             let mut q = self.queue.lock().unwrap();
             if q.is_empty() {
-                return;
+                return Vec::new();
             }
             std::mem::take(&mut *q)
         };
+        let mut announce = Vec::new();
         for ev in events {
+            if let Some(m) = crate::messages::Msg::from_event(&ev) {
+                announce.push(m);
+            }
             let played = ev.sound.as_deref().and_then(|s| play(s, package));
             let spoke = ev
                 .tts_text
@@ -303,6 +435,7 @@ impl Alerts {
         // a log is long; the interesting alert is the last one
         let overflow = self.recent.len().saturating_sub(20);
         self.recent.drain(..overflow);
+        announce
     }
 }
 
@@ -883,7 +1016,7 @@ mod tests {
         let pattern = builder::regex(&tokens, &chosen, &Default::default());
 
         let mut alerts = Alerts::load(true);
-        alerts.add_trigger("merge", &pattern, "Ding", "{1} merged to plus {2}");
+        alerts.add_trigger("merge", &pattern, "Ding", "{1} merged to plus {2}", "");
         assert_eq!(alerts.count(), 1, "trigger should be in the config");
 
         // it must survive the round trip through the file
@@ -893,6 +1026,77 @@ mod tests {
         alerts.test_line(line);
         alerts.pump("default", &Voice::SpeechDispatcher);
         assert!(!alerts.recent.is_empty(), "the trigger should have fired");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The builder only edits an overlay action's TEXT. Icon, colours and
+    /// treatment can only be set by hand-editing triggers.toml, so saving an
+    /// edit through the builder must carry them through untouched rather
+    /// than resetting a carefully styled message to plain white.
+    #[test]
+    #[ignore] // update_trigger WRITES triggers.toml; run alone: cargo test editing_a_message -- --ignored
+    fn editing_a_message_keeps_styling_the_builder_cannot_set() {
+        // Every test that reaches a `save()` has to move HOME first, or it
+        // overwrites the triggers file of whoever is running the suite.
+        let tmp = std::env::temp_dir().join("froklog-watch-msgedit");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("HOME", &tmp);
+
+        // r##: the hex colours below contain `"#`, which would end an r#".
+        let cfg: TriggerConfig = toml::from_str(
+            r##"
+            [[trigger]]
+            name = "Train"
+            [[trigger.condition]]
+            type = "match"
+            match_type = "regex"
+            pattern = "^TRAIN"
+            [[trigger.action]]
+            type = "overlay"
+            icon = "warn"
+            color = "#FF4400"
+            message = "TRAIN TO ZONE"
+            message_color = "#FFDD44"
+            treatment = "vibrate"
+            priority = "emergency"
+            "##,
+        )
+        .expect("valid config");
+        let mut alerts = Alerts {
+            engine: TriggerEngine::new(&cfg, Arc::new(Mutex::new(Vec::new()))),
+            queue: Arc::new(Mutex::new(Vec::new())),
+            recent: Vec::new(),
+            enabled: true,
+            cfg,
+        };
+
+        let p = alerts.parts(0).expect("one condition, one action");
+        assert_eq!(p.show, "TRAIN TO ZONE");
+        assert!(p.say.is_empty());
+
+        // Save with only the text changed, as the builder would.
+        alerts.update_trigger(0, "Train", "^TRAIN", "", "", "TRAIN INCOMING");
+        match &alerts.triggers()[0].actions[0] {
+            Action::Overlay {
+                icon,
+                color,
+                message,
+                message_color,
+                treatment,
+                priority,
+                ..
+            } => {
+                assert_eq!(message, "TRAIN INCOMING", "the text is the edit");
+                assert_eq!(icon, "warn", "icon survived");
+                assert_eq!(color, "#FF4400", "accent survived");
+                assert_eq!(message_color, "#FFDD44", "text colour survived");
+                assert_eq!(*treatment, froklog::triggers::engine::Treatment::Vibrate, "treatment survived");
+                assert_eq!(*priority, VoicePriority::Emergency, "priority survived");
+            }
+            other => panic!("expected an overlay action, got {other:?}"),
+        }
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -934,15 +1138,17 @@ mod tests {
             r"^You (\w+) Emperor Crush for 37 points of damage\. \((\w+)\)",
             "",
             "Critical",
+            "",
         );
         alerts.set_enabled(0, false);
 
         // it comes back apart the way the builder needs it
-        let (name, pattern, sound, say) = alerts.parts(0).expect("builder can hold it");
-        assert_eq!(name, "Critical");
-        assert_eq!(say, "Critical");
-        assert!(sound.is_empty());
-        assert!(pattern.contains("Emperor Crush"), "{pattern}");
+        let p = alerts.parts(0).expect("builder can hold it");
+        assert_eq!(p.name, "Critical");
+        assert_eq!(p.say, "Critical");
+        assert!(p.sound.is_empty());
+        assert!(p.show.is_empty());
+        assert!(p.pattern.contains("Emperor Crush"), "{}", p.pattern);
 
         // broaden it the way the word picker's * state would
         alerts.update_trigger(
@@ -951,6 +1157,7 @@ mod tests {
             r"^You (\w+) .+? for \d+ points of damage\. \(Critical\)",
             "",
             "{1}",
+            "CRIT {1}",
         );
         assert_eq!(alerts.count(), 1, "edit replaces, it does not append");
         assert!(

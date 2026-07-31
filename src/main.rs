@@ -12,6 +12,7 @@ mod autostart;
 mod engine;
 mod icon;
 mod logscan;
+mod messages;
 mod meter_core;
 mod meter_ui;
 mod outputs;
@@ -43,6 +44,7 @@ enum Tab {
     Sounds,
     Speech,
     Meter,
+    Messages,
 }
 
 /// One character as the tray menu needs it.
@@ -259,6 +261,8 @@ struct App {
     new_name: String,
     new_sound: String,
     new_say: String,
+    /// text a trigger puts on the message overlay
+    new_show: String,
     /// triggers.toml open in the built-in editor
     editing: bool,
     trigger_text: String,
@@ -288,6 +292,14 @@ struct App {
     tray_connected_ok: Arc<Mutex<bool>>,
     /// whether the overlay was last told to preview (Meter tab open)
     meter_preview: bool,
+    /// the trigger message overlay's layer-shell thread, while it is enabled
+    msg_overlay: Option<overlay::OverlayHandle>,
+    /// layer-shell unavailable — the message overlay has no X11 fallback
+    /// (unlike the meter, it has nothing to show most of the time, so an
+    /// always-on-top viewport would just be an empty window in the way)
+    msg_x11: bool,
+    msg_preview: bool,
+    msg_moved_at: Option<std::time::Instant>,
     /// monitor list for the Meter tab's picker, fetched when the tab opens
     monitors: Option<Vec<(String, String)>>,
     /// Triggers tab scratch: log search text and results, template scan
@@ -361,6 +373,8 @@ impl App {
         if s.meter_enabled && self.overlay.is_none() && !self.meter_x11 {
             if let (true, Some(instance)) = (wayland, self.meter_instance.clone()) {
                 self.overlay = Some(overlay::spawn(overlay::OverlaySpawn {
+                    kind: overlay::Kind::Meter,
+                    msg_style: Default::default(),
                     instance,
                     output: s.meter_output.clone(),
                     feeds: self.overlay_feeds(),
@@ -384,6 +398,102 @@ impl App {
             }
         } else if let Some(o) = &self.overlay {
             let _ = o.tx.send(overlay::OverlayMsg::Feeds(self.overlay_feeds()));
+        }
+    }
+
+    fn msg_style(&self) -> messages::MessageStyle {
+        let s = &self.reg.settings;
+        messages::MessageStyle {
+            peak_size: s.msg_peak_size,
+            hold_secs: s.msg_hold_secs,
+            history_rows: s.msg_history_rows,
+            idle_secs: s.msg_idle_secs,
+            ..Default::default()
+        }
+    }
+
+    /// Same shape as `sync_overlay`, for the trigger message window.
+    fn sync_msg_overlay(&mut self) {
+        let s = &self.reg.settings;
+        let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+        if s.msg_enabled && self.msg_overlay.is_none() && !self.msg_x11 {
+            if let (true, Some(instance)) = (wayland, self.meter_instance.clone()) {
+                self.msg_overlay = Some(overlay::spawn(overlay::OverlaySpawn {
+                    kind: overlay::Kind::Messages,
+                    msg_style: self.msg_style(),
+                    instance,
+                    output: s.msg_output.clone(),
+                    feeds: Vec::new(),
+                    locked: s.msg_locked,
+                    x: s.msg_x,
+                    y: s.msg_y,
+                    width: s.msg_width,
+                    max_rows: 0,
+                    font_size: 14.0,
+                    idle_secs: s.msg_idle_secs,
+                }));
+                self.msg_preview = false;
+            } else {
+                self.msg_x11 = true;
+            }
+        } else if !s.msg_enabled {
+            if let Some(o) = self.msg_overlay.take() {
+                let _ = o.tx.send(overlay::OverlayMsg::Quit);
+            }
+        }
+    }
+
+    /// Hand one fired trigger's announcement to the message window.
+    fn announce(&mut self, msg: messages::Msg) {
+        if let Some(o) = &self.msg_overlay {
+            let _ = o
+                .tx
+                .send(overlay::OverlayMsg::Announce(Box::new(msg)));
+        }
+    }
+
+    fn push_msg_settings(&self) {
+        if let Some(o) = &self.msg_overlay {
+            let _ = o
+                .tx
+                .send(overlay::OverlayMsg::SetMessageStyle(self.msg_style()));
+            let _ = o
+                .tx
+                .send(overlay::OverlayMsg::SetLocked(self.reg.settings.msg_locked));
+        }
+    }
+
+    /// Drags to persist, and death to notice. The message window has no
+    /// clipboard or settings chrome, so those arms cannot occur.
+    fn poll_msg_overlay(&mut self) {
+        let Some(o) = &self.msg_overlay else { return };
+        let mut fell = false;
+        while let Ok(ev) = o.events.try_recv() {
+            match ev {
+                overlay::OverlayEvent::Moved(x, y) => {
+                    self.reg.settings.msg_x = x;
+                    self.reg.settings.msg_y = y;
+                    self.msg_moved_at = Some(std::time::Instant::now());
+                }
+                overlay::OverlayEvent::Exited(err) => {
+                    if let Some(e) = err {
+                        self.status = format!("message overlay stopped: {e}");
+                    }
+                    fell = true;
+                }
+                overlay::OverlayEvent::Copy(_) | overlay::OverlayEvent::OpenSettings => {}
+            }
+        }
+        if fell {
+            self.msg_overlay = None;
+            self.msg_x11 = true;
+        }
+        // Debounced like the meter's: one save per drop, not per motion.
+        if let Some(t) = self.msg_moved_at {
+            if t.elapsed().as_millis() > 600 {
+                self.msg_moved_at = None;
+                self.save();
+            }
         }
     }
 
@@ -575,6 +685,7 @@ impl App {
             }
         }
         self.sync_overlay();
+        self.sync_msg_overlay();
     }
 
     fn import(&mut self, key: String) {
@@ -809,6 +920,7 @@ impl eframe::App for App {
             *self.tray_connected_ok.lock().unwrap() = ok;
         }
         self.poll_overlay(ctx);
+        self.poll_msg_overlay();
         // While the Meter tab is open the overlay force-renders a placeholder
         // — an idle-hidden meter during setup looks exactly like a crash.
         let want_preview = self.tab == Tab::Meter && self.reg.settings.meter_enabled;
@@ -816,6 +928,15 @@ impl eframe::App for App {
             self.meter_preview = want_preview;
             if let Some(o) = &self.overlay {
                 let _ = o.tx.send(overlay::OverlayMsg::Preview(want_preview));
+            }
+        }
+        // Same for the message window: it is hidden whenever nothing has
+        // fired, which is most of the time.
+        let want_msg_preview = self.tab == Tab::Messages && self.reg.settings.msg_enabled;
+        if want_msg_preview != self.msg_preview {
+            self.msg_preview = want_msg_preview;
+            if let Some(o) = &self.msg_overlay {
+                let _ = o.tx.send(overlay::OverlayMsg::Preview(want_msg_preview));
             }
         }
         if self.reg.settings.meter_enabled && self.meter_x11 {
@@ -842,7 +963,9 @@ impl eframe::App for App {
             &self.reg.settings.voice_engine,
             &self.reg.settings.piper_model,
         );
-        self.alerts.pump(&self.reg.settings.sound_package, &voice);
+        for m in self.alerts.pump(&self.reg.settings.sound_package, &voice) {
+            self.announce(m);
+        }
 
         self.collect_registrations();
         self.collect_imports();
@@ -871,6 +994,7 @@ impl eframe::App for App {
                     (Tab::Sounds, "Sounds"),
                     (Tab::Speech, "Speech"),
                     (Tab::Meter, "Meter"),
+                    (Tab::Messages, "Messages"),
                 ] {
                     if ui.selectable_label(self.tab == tab, label).clicked() {
                         self.tab = tab;
@@ -1500,6 +1624,18 @@ impl eframe::App for App {
                                 .hint_text("spoken text, e.g. {1} merged an item to plus {2}"),
                         );
                         ui.end_row();
+                        ui.label("show");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.new_show)
+                                .desired_width(240.0)
+                                .hint_text("on-screen text — needs the Messages overlay"),
+                        )
+                        .on_hover_text(
+                            "Announced in big text over the game, then kept in the \
+                             message overlay's list. Same {1} placeholders as the \
+                             spoken text.",
+                        );
+                        ui.end_row();
 
                         // The captures, spelled out and clickable. That the
                         // picked words come back as {1}, {2} is the one bit of
@@ -1529,7 +1665,9 @@ impl eframe::App for App {
 
                     ui.horizontal(|ui| {
                         let ready = !self.new_name.trim().is_empty()
-                            && (!self.new_sound.is_empty() || !self.new_say.trim().is_empty());
+                            && (!self.new_sound.is_empty()
+                                || !self.new_say.trim().is_empty()
+                                || !self.new_show.trim().is_empty());
                         let save_label = match self.edit_index {
                             Some(_) => "Save changes",
                             None => "Create trigger",
@@ -1537,7 +1675,7 @@ impl eframe::App for App {
                         if ui
                             .add_enabled(ready, egui::Button::new(save_label))
                             .on_hover_text("Writes it to triggers.toml and starts matching now")
-                            .on_disabled_hover_text("Needs a name, and a sound or something to say")
+                            .on_disabled_hover_text("Needs a name, and a sound, something to say, or something to show")
                             .clicked()
                         {
                             match self.edit_index {
@@ -1548,6 +1686,7 @@ impl eframe::App for App {
                                         self.builder_pattern.trim(),
                                         &self.new_sound,
                                         self.new_say.trim(),
+                                        self.new_show.trim(),
                                     );
                                     self.status =
                                         format!("saved \"{}\"", self.new_name.trim());
@@ -1558,6 +1697,7 @@ impl eframe::App for App {
                                         self.builder_pattern.trim(),
                                         &self.new_sound,
                                         self.new_say.trim(),
+                                        self.new_show.trim(),
                                     );
                                     self.status = format!("added \"{}\"", self.new_name.trim());
                                 }
@@ -1566,6 +1706,7 @@ impl eframe::App for App {
                             self.pattern_manual = false;
                             self.new_name.clear();
                             self.new_say.clear();
+                            self.new_show.clear();
                             self.builder_chosen.clear();
                             self.builder_wild.clear();
                             self.builder_line.clear();
@@ -1591,6 +1732,7 @@ impl eframe::App for App {
                             self.builder_pattern_auto.clear();
                             self.new_name.clear();
                             self.new_say.clear();
+                            self.new_show.clear();
                             self.status = if was_editing {
                                 "edit cancelled — trigger left as it was".into()
                             } else {
@@ -1768,11 +1910,14 @@ impl eframe::App for App {
                         &self.reg.settings.voice_engine,
                         &self.reg.settings.piper_model,
                     );
-                    self.alerts.fire_trigger_actions(
+                    let shown = self.alerts.fire_trigger_actions(
                         i,
                         &self.reg.settings.sound_package,
                         &voice,
                     );
+                    for m in shown {
+                        self.announce(m);
+                    }
                     self.status = format!("fired \"{name}\"'s actions");
                 }
                 if let Some(i) = delete {
@@ -1790,11 +1935,13 @@ impl eframe::App for App {
                 }
                 if let Some(i) = edit {
                     match self.alerts.parts(i) {
-                        Some((name, pattern, sound, say)) => {
+                        Some(p) => {
+                            let name = p.name.clone();
                             self.edit_index = Some(i);
-                            self.new_name = name.clone();
-                            self.new_sound = sound;
-                            self.new_say = say;
+                            self.new_name = p.name;
+                            self.new_sound = p.sound;
+                            self.new_say = p.say;
+                            self.new_show = p.show;
                             // The word picker starts empty: this pattern came
                             // from the file, not from a line, and letting the
                             // generator run would overwrite it on the next
@@ -1808,7 +1955,7 @@ impl eframe::App for App {
                                 &self.builder_chosen,
                                 &self.builder_wild,
                             );
-                            self.builder_pattern = pattern;
+                            self.builder_pattern = p.pattern;
                             self.pattern_manual = true;
                             self.status = format!("editing \"{name}\" — Save changes when done");
                         }
@@ -2404,6 +2551,242 @@ impl eframe::App for App {
                         }
                     }
                 }
+                Tab::Messages => {
+                    ui.label(
+                        egui::RichText::new(
+                            "What a trigger SHOWS, as opposed to what it plays or says. \
+                             A message flies in at full size, holds, then drops into a \
+                             list of what has fired recently.",
+                        )
+                        .italics()
+                        .weak(),
+                    );
+                    ui.add_space(6.0);
+
+                    let s = &mut self.reg.settings;
+                    let mut msg_dirty = false;
+                    let mut style_dirty = false;
+
+                    if ui
+                        .checkbox(&mut s.msg_enabled, "Show the message overlay")
+                        .changed()
+                    {
+                        msg_dirty = true;
+                    }
+                    let lock = ui.checkbox(
+                        &mut s.msg_locked,
+                        "Locked — click-through: the mouse goes to the game",
+                    );
+                    if lock.changed() {
+                        msg_dirty = true;
+                        style_dirty = true;
+                    }
+                    lock.on_hover_text(
+                        "Unlike the meter this window has nothing to click, so lock it \
+                         once it is where you want it.",
+                    );
+
+                    ui.add_space(6.0);
+                    let monitors = match &self.monitors {
+                        Some(m) => m.clone(),
+                        None => {
+                            let m = outputs::list();
+                            self.monitors = Some(m.clone());
+                            m
+                        }
+                    };
+                    let mut respawn_for_output = false;
+                    let mut resize = false;
+                    egui::Grid::new("msg-settings").num_columns(2).show(ui, |ui| {
+                        ui.label("monitor");
+                        {
+                            let current = if s.msg_output.is_empty() {
+                                "(focused monitor)".to_string()
+                            } else {
+                                s.msg_output.clone()
+                            };
+                            egui::ComboBox::from_id_salt("msg-output")
+                                .selected_text(current)
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_label(
+                                            s.msg_output.is_empty(),
+                                            "(focused monitor)",
+                                        )
+                                        .clicked()
+                                        && !s.msg_output.is_empty()
+                                    {
+                                        s.msg_output.clear();
+                                        msg_dirty = true;
+                                        respawn_for_output = true;
+                                    }
+                                    for (name, desc) in &monitors {
+                                        let label = if desc.is_empty() {
+                                            name.clone()
+                                        } else {
+                                            format!("{name} — {desc}")
+                                        };
+                                        if ui
+                                            .selectable_label(&s.msg_output == name, label)
+                                            .clicked()
+                                            && &s.msg_output != name
+                                        {
+                                            s.msg_output = name.clone();
+                                            msg_dirty = true;
+                                            respawn_for_output = true;
+                                        }
+                                    }
+                                });
+                        }
+                        ui.end_row();
+
+                        ui.label("position");
+                        ui.horizontal(|ui| {
+                            let (mut x, mut y) = (s.msg_x, s.msg_y);
+                            let rx = ui.add(egui::DragValue::new(&mut x).prefix("x "));
+                            let ry = ui.add(egui::DragValue::new(&mut y).prefix("y "));
+                            if rx.changed() || ry.changed() {
+                                s.msg_x = x.max(0);
+                                s.msg_y = y.max(0);
+                                msg_dirty = true;
+                                if let Some(o) = &self.msg_overlay {
+                                    let _ = o
+                                        .tx
+                                        .send(overlay::OverlayMsg::SetPosition(s.msg_x, s.msg_y));
+                                }
+                            }
+                        });
+                        ui.end_row();
+
+                        ui.label("width");
+                        let mut w = s.msg_width;
+                        if ui
+                            .add(egui::Slider::new(&mut w, 260..=900).suffix(" px"))
+                            .changed()
+                        {
+                            s.msg_width = w;
+                            msg_dirty = true;
+                            resize = true;
+                        }
+                        ui.end_row();
+
+                        ui.label("announce size");
+                        let mut peak = s.msg_peak_size;
+                        if ui
+                            .add(egui::Slider::new(&mut peak, 16.0..=72.0).suffix(" pt"))
+                            .changed()
+                        {
+                            s.msg_peak_size = peak;
+                            msg_dirty = true;
+                            style_dirty = true;
+                        }
+                        ui.end_row();
+
+                        ui.label("hold");
+                        let mut hold = s.msg_hold_secs;
+                        if ui
+                            .add(egui::Slider::new(&mut hold, 0.5..=8.0).suffix(" s"))
+                            .changed()
+                        {
+                            s.msg_hold_secs = hold;
+                            msg_dirty = true;
+                            style_dirty = true;
+                        }
+                        ui.end_row();
+
+                        ui.label("history rows");
+                        let mut rows = s.msg_history_rows;
+                        if ui.add(egui::Slider::new(&mut rows, 1..=20)).changed() {
+                            s.msg_history_rows = rows;
+                            msg_dirty = true;
+                            style_dirty = true;
+                        }
+                        ui.end_row();
+
+                        ui.label("idle hide");
+                        let mut idle = s.msg_idle_secs;
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut idle, 0..=120)
+                                    .suffix(" s")
+                                    .custom_formatter(|v, _| {
+                                        if v == 0.0 {
+                                            "never".into()
+                                        } else {
+                                            format!("{v:.0} s")
+                                        }
+                                    }),
+                            )
+                            .changed()
+                        {
+                            s.msg_idle_secs = idle;
+                            msg_dirty = true;
+                            style_dirty = true;
+                        }
+                        ui.end_row();
+                    });
+
+                    ui.add_space(6.0);
+                    if ui
+                        .button("Show a test message")
+                        .on_hover_text("Sends one through the real overlay, so what you \
+                                        see is what a trigger will look like")
+                        .clicked()
+                    {
+                        let m = messages::Msg {
+                            icon: "warn".into(),
+                            color: String::new(),
+                            text: "A greater skeleton hits you for 175".into(),
+                            text_color: String::new(),
+                            border_color: String::new(),
+                            treatment: Default::default(),
+                            priority: Default::default(),
+                        };
+                        self.announce(m);
+                        self.status = "test message sent".into();
+                    }
+
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "A trigger contributes a message here by having a \"show\" \
+                             text — set that on the Triggers tab. While this tab is \
+                             open the window stays visible for positioning; in play it \
+                             appears when something fires and hides again afterwards.",
+                        )
+                        .weak(),
+                    );
+                    if self.msg_x11 {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "Compositor overlay not available here — the message \
+                                 window cannot run. Sounds and speech still work.",
+                            )
+                            .weak(),
+                        );
+                    }
+
+                    if msg_dirty {
+                        dirty = true;
+                    }
+                    if style_dirty {
+                        self.push_msg_settings();
+                    }
+                    if respawn_for_output {
+                        if let Some(o) = self.msg_overlay.take() {
+                            let _ = o.tx.send(overlay::OverlayMsg::Quit);
+                        }
+                        self.status = "message overlay moving to the selected monitor…".into();
+                    }
+                    if resize {
+                        let w = self.reg.settings.msg_width;
+                        let h = messages::surface_height(&self.msg_style());
+                        if let Some(o) = &self.msg_overlay {
+                            let _ = o.tx.send(overlay::OverlayMsg::SetSize(w, h));
+                        }
+                    }
+                }
                 Tab::Characters => {
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -2731,6 +3114,7 @@ fn main() -> eframe::Result<()> {
         new_name: String::new(),
         new_sound: "Ding".into(),
         new_say: String::new(),
+        new_show: String::new(),
         editing: false,
         trigger_text: String::new(),
         trigger_err: None,
@@ -2746,6 +3130,10 @@ fn main() -> eframe::Result<()> {
         meter_on,
         tray_connected_ok: connected_ok,
         meter_preview: false,
+        msg_overlay: None,
+        msg_x11: false,
+        msg_preview: false,
+        msg_moved_at: None,
         monitors: None,
         log_search: String::new(),
         log_results: Vec::new(),
