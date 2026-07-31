@@ -101,8 +101,6 @@ impl Alerts {
         Ok(n)
     }
 
-    /// Append a new trigger and write it to the same file the Windows client
-    /// reads, so anything built here is portable back to it.
     /// Fire one trigger's own actions, right now, ignoring its conditions —
     /// the honest per-trigger test. (No fake line can match an arbitrary
     /// pattern, so the actions are executed directly; unfilled `{n}` capture
@@ -145,6 +143,8 @@ impl Alerts {
         }
     }
 
+    /// Append a new trigger and write it to the same file the Windows client
+    /// reads, so anything built here is portable back to it.
     pub fn add_trigger(&mut self, name: &str, pattern: &str, sound: &str, say: &str) {
         let mut actions = Vec::new();
         if !sound.is_empty() {
@@ -489,16 +489,43 @@ pub mod builder {
         }
     }
 
-    /// Build the pattern: chosen tokens become capture groups, everything else
-    /// is matched literally and escaped, so a name containing a bracket or a
-    /// full stop cannot silently turn into a wildcard.
-    pub fn regex(tokens: &[String], chosen: &BTreeSet<usize>) -> String {
+    /// Build the pattern: chosen tokens become capture groups, wild tokens
+    /// become don't-care wildcards, everything else is matched literally and
+    /// escaped, so a name containing a bracket or a full stop cannot
+    /// silently turn into a wildcard.
+    ///
+    /// Adjacent wild words COLLAPSE into one `.+?` — including the spaces
+    /// between them — because the thing that varies is usually a mob name
+    /// and mob names change word count ("a rat" / "a greater skeleton").
+    /// One trigger built on either matches both.
+    pub fn regex(tokens: &[String], chosen: &BTreeSet<usize>, wild: &BTreeSet<usize>) -> String {
         let mut out = String::from("^");
-        for (i, tok) in tokens.iter().enumerate() {
+        let mut i = 0;
+        while i < tokens.len() {
             if chosen.contains(&i) {
-                out.push_str(capture_for(tok));
+                out.push_str(capture_for(&tokens[i]));
+                i += 1;
+            } else if wild.contains(&i) {
+                // Swallow this wild run: further wild words and whatever
+                // separators sit between them.
+                out.push_str(".+?");
+                i += 1;
+                loop {
+                    // Separators directly before another wild word belong
+                    // to the run; a separator before a literal does not.
+                    let mut j = i;
+                    while j < tokens.len() && !is_word(&tokens[j]) {
+                        j += 1;
+                    }
+                    if j < tokens.len() && wild.contains(&j) {
+                        i = j + 1;
+                    } else {
+                        break;
+                    }
+                }
             } else {
-                out.push_str(&escape(tok));
+                out.push_str(&escape(&tokens[i]));
+                i += 1;
             }
         }
         out
@@ -689,6 +716,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn one_crit_trigger_covers_all_verbs_and_mobs() {
+        // verb = capture, mob words + damage = wildcards, "(Critical)" literal.
+        let line = "You strike a greater skeleton for 175 points of damage. (Critical)";
+        let tokens = builder::tokenize(line);
+        let chosen: std::collections::BTreeSet<usize> = tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.as_str() == "strike")
+            .map(|(i, _)| i)
+            .collect();
+        let wild: std::collections::BTreeSet<usize> = tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| ["a", "greater", "skeleton", "175"].contains(&t.as_str()))
+            .map(|(i, _)| i)
+            .collect();
+        let pattern = builder::regex(&tokens, &chosen, &wild);
+        let re = regex::Regex::new(&pattern).unwrap();
+        // the built-from line matches, with the verb captured
+        assert_eq!(&re.captures(line).unwrap()[1], "strike");
+        // and so do other verbs, mobs of DIFFERENT word counts, other damage
+        let kick = "You kick a rat for 3 points of damage. (Critical)";
+        assert_eq!(&re.captures(kick).unwrap()[1], "kick");
+        // but a non-crit line does not
+        assert!(re.captures("You kick a rat for 3 points of damage.").is_none());
+    }
+
+    #[test]
     fn builds_a_pattern_from_a_pasted_line() {
         use builder::*;
         let raw = "[Sun Jul 26 19:12:18 2026] Zarri says, 'Hail, Icestorm'";
@@ -706,7 +761,7 @@ mod tests {
             .collect();
         assert_eq!(chosen.len(), 2);
 
-        let pattern = regex(&tokens, &chosen);
+        let pattern = regex(&tokens, &chosen, &Default::default());
         // captures where we pointed, literal everywhere else
         assert!(pattern.starts_with(r"^(\w+) says, "), "{pattern}");
         assert!(pattern.ends_with(r"(\w+)'"), "{pattern}");
@@ -736,7 +791,7 @@ mod tests {
             .filter(|(_, t)| t.as_str() == "Zarri" || t.as_str() == "4")
             .map(|(i, _)| i)
             .collect();
-        let pattern = builder::regex(&tokens, &chosen);
+        let pattern = builder::regex(&tokens, &chosen, &Default::default());
 
         let mut alerts = Alerts::load(true);
         alerts.add_trigger("merge", &pattern, "Ding", "{1} merged to plus {2}");
@@ -765,7 +820,7 @@ mod tests {
             .filter(|(_, t)| t.as_str() == "Zarri" || t.as_str() == "4")
             .map(|(i, _)| i)
             .collect();
-        let pattern = builder::regex(&tokens, &chosen);
+        let pattern = builder::regex(&tokens, &chosen, &Default::default());
 
         let cfg: TriggerConfig = toml::from_str(&format!(
             r#"

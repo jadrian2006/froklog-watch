@@ -244,6 +244,8 @@ struct App {
     /// a log line being turned into a pattern, and which of its words vary
     builder_line: String,
     builder_chosen: std::collections::BTreeSet<usize>,
+    /// words that vary but aren't wanted as captures — adjacent ones merge
+    builder_wild: std::collections::BTreeSet<usize>,
     /// the pattern as shown — user-editable; regenerated on word clicks
     builder_pattern: String,
     builder_pattern_auto: String,
@@ -1260,6 +1262,7 @@ impl eframe::App for App {
                         if let Some(line) = seed {
                             self.builder_line = line;
                             self.builder_chosen.clear();
+                            self.builder_wild.clear();
                             self.status = "line loaded into the builder".into();
                         }
                     });
@@ -1295,6 +1298,7 @@ impl eframe::App for App {
                         if let Some(line) = seed {
                             self.builder_line = line;
                             self.builder_chosen.clear();
+                            self.builder_wild.clear();
                             self.status = "example loaded into the builder".into();
                         }
                     });
@@ -1310,26 +1314,52 @@ impl eframe::App for App {
                     .changed()
                 {
                     self.builder_chosen.clear();
+                            self.builder_wild.clear();
                 }
 
                 let stripped = alerts::builder::strip_timestamp(&self.builder_line).to_string();
                 if !stripped.is_empty() {
                     let tokens = alerts::builder::tokenize(&stripped);
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(egui::RichText::new("click what varies:").weak().small());
+                        ui.label(
+                            egui::RichText::new(
+                                "click cycles: capture {n} → any (*) → literal:",
+                            )
+                            .weak()
+                            .small(),
+                        )
+                        .on_hover_text(
+                            "capture {n}: the word varies and you want to use it \
+                             (speak it, compare it).\n\
+                             any (*): the word varies but you don't care — mob \
+                             names and damage numbers usually. Neighbouring * \
+                             words merge, so 'a rat' and 'a greater skeleton' \
+                             both match.\n\
+                             literal: must appear exactly.",
+                        );
                         for (i, tok) in tokens.iter().enumerate() {
                             if !alerts::builder::is_word(tok) {
                                 ui.label(egui::RichText::new(tok).weak().monospace());
                                 continue;
                             }
                             let chosen = self.builder_chosen.contains(&i);
-                            let label = match alerts::builder::group_of(&self.builder_chosen, i) {
-                                Some(n) => format!("{tok} {{{n}}}"),
-                                None => tok.clone(),
+                            let wild = self.builder_wild.contains(&i);
+                            let label = if wild {
+                                egui::RichText::new(format!("{tok} *"))
+                                    .weak()
+                                    .strikethrough()
+                            } else {
+                                match alerts::builder::group_of(&self.builder_chosen, i) {
+                                    Some(n) => egui::RichText::new(format!("{tok} {{{n}}}")),
+                                    None => egui::RichText::new(tok.clone()),
+                                }
                             };
-                            if ui.selectable_label(chosen, label).clicked() {
+                            if ui.selectable_label(chosen || wild, label).clicked() {
                                 if chosen {
                                     self.builder_chosen.remove(&i);
+                                    self.builder_wild.insert(i);
+                                } else if wild {
+                                    self.builder_wild.remove(&i);
                                 } else {
                                     self.builder_chosen.insert(i);
                                 }
@@ -1342,7 +1372,7 @@ impl eframe::App for App {
                     // is one edit away from the over-literal auto version.
                     // Clicking words regenerates; manual edits stick until
                     // the next click.
-                    let auto = alerts::builder::regex(&tokens, &self.builder_chosen);
+                    let auto = alerts::builder::regex(&tokens, &self.builder_chosen, &self.builder_wild);
                     if auto != self.builder_pattern_auto {
                         self.builder_pattern_auto = auto.clone();
                         self.builder_pattern = auto;
@@ -1436,6 +1466,7 @@ impl eframe::App for App {
                             self.new_name.clear();
                             self.new_say.clear();
                             self.builder_chosen.clear();
+                            self.builder_wild.clear();
                             self.builder_line.clear();
                             self.builder_pattern.clear();
                             self.builder_pattern_auto.clear();
@@ -2505,6 +2536,7 @@ fn main() -> eframe::Result<()> {
         pron: alerts::pronunciations(),
         builder_line: String::new(),
         builder_chosen: Default::default(),
+        builder_wild: Default::default(),
         builder_pattern: String::new(),
         builder_pattern_auto: String::new(),
         trigger_delete_arm: None,
