@@ -103,6 +103,48 @@ impl Alerts {
 
     /// Append a new trigger and write it to the same file the Windows client
     /// reads, so anything built here is portable back to it.
+    /// Fire one trigger's own actions, right now, ignoring its conditions —
+    /// the honest per-trigger test. (No fake line can match an arbitrary
+    /// pattern, so the actions are executed directly; unfilled `{n}` capture
+    /// placeholders in spoken text become the word "something".)
+    pub fn fire_trigger_actions(&self, index: usize, package: &str, voice: &Voice) {
+        let Some(t) = self.cfg.triggers.get(index) else {
+            return;
+        };
+        for action in &t.actions {
+            match action {
+                Action::PlaySound { sound, .. } => {
+                    if let Some(s) = sound {
+                        play_forced(s, package);
+                    }
+                }
+                Action::VoiceAlert { tts_text, priority } => {
+                    let mut said = tts_text.clone();
+                    while let Some(a) = said.find('{') {
+                        match said[a..].find('}') {
+                            Some(rel) => said.replace_range(a..a + rel + 1, "something"),
+                            None => break,
+                        }
+                    }
+                    speak_forced(&said, priority, voice);
+                }
+                // Overlay/StoreVar have nothing audible to prove — skip.
+                Action::Overlay { .. } | Action::StoreVar { .. } => {}
+            }
+        }
+    }
+
+    /// Remove a trigger permanently — written to triggers.toml and the
+    /// engine reloaded, same as every other edit. (Silencing without losing
+    /// it is what the enable tick is for.)
+    pub fn delete_trigger(&mut self, index: usize) {
+        if index < self.cfg.triggers.len() {
+            self.cfg.triggers.remove(index);
+            self.cfg.save();
+            self.engine.reload(&self.cfg);
+        }
+    }
+
     pub fn add_trigger(&mut self, name: &str, pattern: &str, sound: &str, say: &str) {
         let mut actions = Vec::new();
         if !sound.is_empty() {

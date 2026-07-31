@@ -247,6 +247,8 @@ struct App {
     /// the pattern as shown — user-editable; regenerated on word clicks
     builder_pattern: String,
     builder_pattern_auto: String,
+    /// trigger index whose × is armed, waiting for the second click
+    trigger_delete_arm: Option<usize>,
     new_name: String,
     new_sound: String,
     new_say: String,
@@ -1510,7 +1512,8 @@ impl eframe::App for App {
                 // tick to silence one without deleting it.
                 ui.separator();
                 let mut toggle: Option<(usize, bool)> = None;
-                let mut test: Option<String> = None;
+                let mut test: Option<(usize, String)> = None;
+                let mut delete: Option<usize> = None;
                 if self.alerts.count() == 0 {
                     ui.label(
                         egui::RichText::new("No triggers yet \u{2014} Edit triggers\u{2026} to write one.")
@@ -1531,10 +1534,37 @@ impl eframe::App for App {
                         ui.label(egui::RichText::new(&t.name).strong());
                         if ui
                             .small_button("test")
-                            .on_hover_text("Fire this trigger's actions now")
+                            .on_hover_text(
+                                "Play this trigger's own sound and speech right now \
+                                 (conditions skipped, captures spoken as 'something')",
+                            )
                             .clicked()
                         {
-                            test = Some(t.name.clone());
+                            test = Some((i, t.name.clone()));
+                        }
+                        if self.trigger_delete_arm == Some(i) {
+                            if ui
+                                .small_button(
+                                    egui::RichText::new("really delete?")
+                                        .color(egui::Color32::from_rgb(230, 90, 90)),
+                                )
+                                .clicked()
+                            {
+                                self.trigger_delete_arm = None;
+                                delete = Some(i);
+                            }
+                            if ui.small_button("cancel").clicked() {
+                                self.trigger_delete_arm = None;
+                            }
+                        } else if ui
+                            .small_button(egui::RichText::new("×").weak())
+                            .on_hover_text(
+                                "Delete this trigger from triggers.toml. Asks once \
+                                 more. To silence it temporarily, untick it instead.",
+                            )
+                            .clicked()
+                        {
+                            self.trigger_delete_arm = Some(i);
                         }
                     });
                     ui.horizontal(|ui| {
@@ -1551,11 +1581,27 @@ impl eframe::App for App {
                     self.alerts.set_enabled(i, on);
                     self.status = if on { "trigger on".into() } else { "trigger off".into() };
                 }
-                if let Some(name) = test {
-                    // there is no fake line that matches an arbitrary pattern,
-                    // so paste one into the box and run it through for real
-                    self.alerts.test_line(&self.phrase);
-                    self.status = format!("ran the test line against {name}");
+                if let Some((i, name)) = test {
+                    let voice = alerts::Voice::from_settings(
+                        &self.reg.settings.voice_engine,
+                        &self.reg.settings.piper_model,
+                    );
+                    self.alerts.fire_trigger_actions(
+                        i,
+                        &self.reg.settings.sound_package,
+                        &voice,
+                    );
+                    self.status = format!("fired \"{name}\"'s actions");
+                }
+                if let Some(i) = delete {
+                    let name = self
+                        .alerts
+                        .triggers()
+                        .get(i)
+                        .map(|t| t.name.clone())
+                        .unwrap_or_default();
+                    self.alerts.delete_trigger(i);
+                    self.status = format!("deleted \"{name}\"");
                 }
 
                 if !self.alerts.recent.is_empty() {
@@ -2461,6 +2507,7 @@ fn main() -> eframe::Result<()> {
         builder_chosen: Default::default(),
         builder_pattern: String::new(),
         builder_pattern_auto: String::new(),
+        trigger_delete_arm: None,
         new_name: String::new(),
         new_sound: "Ding".into(),
         new_say: String::new(),
