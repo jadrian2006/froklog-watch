@@ -542,6 +542,23 @@ pub mod builder {
         out
     }
 
+    /// True when text pasted into the "log line" box is plainly a regex
+    /// rather than a line from the game. The builder escapes whatever it is
+    /// given, so a regex pasted into the wrong box becomes a pattern that
+    /// matches literal backslashes and can never fire — silently, because
+    /// it still looks roughly right in the pattern field.
+    pub fn looks_like_regex(line: &str) -> bool {
+        let t = line.trim();
+        if t.is_empty() {
+            return false;
+        }
+        t.starts_with('^')
+            || t.ends_with('$')
+            || ["\\w", "\\d", "\\s", ".+?", ".*?", "(?:", "[^"]
+                .iter()
+                .any(|m| t.contains(m))
+    }
+
     /// True for the tokens worth offering as a variable — the words, not the
     /// spaces and commas between them.
     pub fn is_word(tok: &str) -> bool {
@@ -878,6 +895,25 @@ mod tests {
         assert!(!alerts.recent.is_empty(), "the trigger should have fired");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A regex pasted into the log-line box has to be caught: the builder
+    /// escapes it into a pattern that matches literal backslashes, looks
+    /// plausible in the field, and never fires. Real log lines must not
+    /// trip the check.
+    #[test]
+    fn a_pasted_regex_is_not_mistaken_for_a_log_line() {
+        assert!(builder::looks_like_regex(
+            r"^You (\w+) .+? for \d+ points of damage\. \(Critical\)"
+        ));
+        assert!(builder::looks_like_regex(r"(\w+) says, '.+?'"));
+        assert!(!builder::looks_like_regex(
+            "You slash a greater skeleton for 96 points of damage. (Critical)"
+        ));
+        assert!(!builder::looks_like_regex(
+            "[Fri Jul 31 08:48:45 2026] Zarri has merged an item to +4"
+        ));
+        assert!(!builder::looks_like_regex(""));
     }
 
     /// Editing an existing trigger: it comes back apart into the builder's

@@ -253,6 +253,9 @@ struct App {
     trigger_delete_arm: Option<usize>,
     /// trigger being edited in the builder — Some means Create becomes Save
     edit_index: Option<usize>,
+    /// the pattern was loaded or hand-written, so the word picker must not
+    /// silently regenerate over it when a line is pasted to test against
+    pattern_manual: bool,
     new_name: String,
     new_sound: String,
     new_say: String,
@@ -1301,6 +1304,8 @@ impl eframe::App for App {
                             self.builder_line = line;
                             self.builder_chosen.clear();
                             self.builder_wild.clear();
+                            // picking an example means "build from this"
+                            self.pattern_manual = false;
                             self.status = "example loaded into the builder".into();
                         }
                     });
@@ -1343,6 +1348,34 @@ impl eframe::App for App {
                 {
                     self.builder_chosen.clear();
                             self.builder_wild.clear();
+                }
+
+                // A regex pasted into the line box gets escaped into a pattern
+                // that matches literal backslashes — it looks plausible and
+                // never fires. Say so, and offer the one-click repair.
+                if alerts::builder::looks_like_regex(&self.builder_line) {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "\u{26a0} that looks like a regex, not a log line \u{2014} \
+                                 pasted here it would be matched literally and never fire.",
+                            )
+                            .small()
+                            .color(egui::Color32::from_rgb(235, 170, 70)),
+                        );
+                        if ui
+                            .small_button("Use as pattern")
+                            .on_hover_text("Move it to the pattern field below, unescaped")
+                            .clicked()
+                        {
+                            self.builder_pattern = self.builder_line.trim().to_string();
+                            self.pattern_manual = true;
+                            self.builder_line.clear();
+                            self.builder_chosen.clear();
+                            self.builder_wild.clear();
+                            self.status = "pattern set from the pasted regex".into();
+                        }
+                    });
                 }
 
                 let stripped = alerts::builder::strip_timestamp(&self.builder_line).to_string();
@@ -1409,17 +1442,28 @@ impl eframe::App for App {
                     let auto = alerts::builder::regex(&tokens, &self.builder_chosen, &self.builder_wild);
                     if auto != self.builder_pattern_auto {
                         self.builder_pattern_auto = auto.clone();
-                        if self.edit_index.is_none() || word_click {
+                        // A word click is an explicit "rebuild from this
+                        // line" and outranks anything typed or loaded.
+                        if !self.pattern_manual || word_click {
                             self.builder_pattern = auto;
                         }
                     }
+                    if word_click {
+                        self.pattern_manual = false;
+                    }
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("pattern").weak().small());
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.builder_pattern)
-                                .font(egui::TextStyle::Monospace)
-                                .desired_width(340.0),
-                        );
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut self.builder_pattern)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(340.0),
+                            )
+                            .changed()
+                        {
+                            // typed here by hand: keep it until a word click
+                            self.pattern_manual = true;
+                        }
                         if ui.small_button("copy").clicked() {
                             ui.output_mut(|o| o.copied_text = self.builder_pattern.clone());
                             self.status = "pattern copied".into();
@@ -1519,6 +1563,7 @@ impl eframe::App for App {
                                 }
                             }
                             self.edit_index = None;
+                            self.pattern_manual = false;
                             self.new_name.clear();
                             self.new_say.clear();
                             self.builder_chosen.clear();
@@ -1538,6 +1583,7 @@ impl eframe::App for App {
                         {
                             let was_editing = self.edit_index.is_some();
                             self.edit_index = None;
+                            self.pattern_manual = false;
                             self.builder_line.clear();
                             self.builder_chosen.clear();
                             self.builder_wild.clear();
@@ -1763,6 +1809,7 @@ impl eframe::App for App {
                                 &self.builder_wild,
                             );
                             self.builder_pattern = pattern;
+                            self.pattern_manual = true;
                             self.status = format!("editing \"{name}\" — Save changes when done");
                         }
                         None => {
@@ -2680,6 +2727,7 @@ fn main() -> eframe::Result<()> {
         builder_pattern_auto: String::new(),
         trigger_delete_arm: None,
         edit_index: None,
+        pattern_manual: false,
         new_name: String::new(),
         new_sound: "Ding".into(),
         new_say: String::new(),
