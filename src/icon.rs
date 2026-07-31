@@ -4,13 +4,28 @@
 //! the tray matches the icon on the tab — one thing to recognise, not two.
 //! They are 16×16 because that is what a favicon is; the dock will scale them.
 
-/// Watching at least one character.
-pub const GREEN: &[u8] = include_bytes!("../assets/froklog-green.png");
-/// Idle — nothing being streamed.
-pub const GRAY: &[u8] = include_bytes!("../assets/froklog-gray.png");
 /// The titlebar and dock want more than 16 pixels. Nearest-neighbour upscale,
 /// which suits pixel art: it stays crisp instead of going soft.
 pub const WINDOW: &[u8] = include_bytes!("../assets/icons/froklog-watch-64.png");
+
+/// Multi-size tray sets, tinted from the 256×256 frog in upstream's
+/// froklog.ico (the 16×16 favicons went blurry on HiDPI panels). State
+/// colors follow the Windows client's tray language: green = streaming,
+/// orange = wants to stream but the connection is down, gray = idle.
+macro_rules! tray_set {
+    ($state:literal) => {
+        [
+            include_bytes!(concat!("../assets/tray/frog-", $state, "-16.png")) as &[u8],
+            include_bytes!(concat!("../assets/tray/frog-", $state, "-24.png")),
+            include_bytes!(concat!("../assets/tray/frog-", $state, "-32.png")),
+            include_bytes!(concat!("../assets/tray/frog-", $state, "-48.png")),
+            include_bytes!(concat!("../assets/tray/frog-", $state, "-64.png")),
+        ]
+    };
+}
+pub const TRAY_GREEN: [&[u8]; 5] = tray_set!("green");
+pub const TRAY_ORANGE: [&[u8]; 5] = tray_set!("orange");
+pub const TRAY_GRAY: [&[u8]; 5] = tray_set!("gray");
 
 pub struct Rgba {
     pub width: u32,

@@ -52,21 +52,32 @@ struct TrayChar {
     public: bool,
 }
 
-/// Tray artwork, decoded once: (width, height, ARGB32).
+/// Tray artwork, decoded once: multiple sizes per state so HiDPI panels
+/// pick a crisp pixmap instead of upscaling a favicon.
 struct TrayArt {
-    green: (i32, i32, Vec<u8>),
-    gray: (i32, i32, Vec<u8>),
+    green: Vec<ksni::Icon>,
+    orange: Vec<ksni::Icon>,
+    gray: Vec<ksni::Icon>,
 }
 
 impl TrayArt {
     fn load() -> Self {
-        let prep = |bytes| {
-            let img = icon::decode(bytes);
-            (img.width as i32, img.height as i32, icon::to_argb(&img))
+        let prep = |set: &[&'static [u8]]| {
+            set.iter()
+                .map(|bytes| {
+                    let img = icon::decode(bytes);
+                    ksni::Icon {
+                        width: img.width as i32,
+                        height: img.height as i32,
+                        data: icon::to_argb(&img),
+                    }
+                })
+                .collect()
         };
         Self {
-            green: prep(icon::GREEN),
-            gray: prep(icon::GRAY),
+            green: prep(&icon::TRAY_GREEN),
+            orange: prep(&icon::TRAY_ORANGE),
+            gray: prep(&icon::TRAY_GRAY),
         }
     }
 }
@@ -77,6 +88,9 @@ struct Tray {
     /// registered characters, rebuilt whenever the registry changes
     links: Arc<Mutex<Vec<TrayChar>>>,
     watching: Arc<Mutex<usize>>,
+    /// false while any watched pipeline's pusher is disconnected — the
+    /// tray goes orange (the Windows client's "wants to push, can't" color)
+    connected_ok: Arc<Mutex<bool>>,
     /// whether the DPS meter overlay is on, so the menu label can flip
     meter_on: Arc<Mutex<bool>>,
 }
@@ -99,16 +113,14 @@ impl ksni::Tray for Tray {
         String::new()
     }
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-        let art = if *self.watching.lock().unwrap() > 0 {
+        let art = if *self.watching.lock().unwrap() == 0 {
+            &self.art.gray
+        } else if *self.connected_ok.lock().unwrap() {
             &self.art.green
         } else {
-            &self.art.gray
+            &self.art.orange
         };
-        vec![ksni::Icon {
-            width: art.0,
-            height: art.1,
-            data: art.2.clone(),
-        }]
+        art.clone()
     }
     fn activate(&mut self, _x: i32, _y: i32) {
         let _ = self.tx.send(TrayMsg::Show);
@@ -258,6 +270,8 @@ struct App {
     /// last drag movement, so position saves are debounced to once per drop
     meter_moved_at: Option<std::time::Instant>,
     meter_on: Arc<Mutex<bool>>,
+    /// shared with the tray: all watched pipelines currently connected?
+    tray_connected_ok: Arc<Mutex<bool>>,
     /// whether the overlay was last told to preview (Meter tab open)
     meter_preview: bool,
 }
@@ -758,6 +772,15 @@ impl eframe::App for App {
                 }
                 TrayMsg::Quit => std::process::exit(0),
             }
+        }
+        // Feed the tray's state color: orange when any watched pipeline's
+        // pusher has lost the server.
+        {
+            let ok = self
+                .running
+                .values()
+                .all(|h| h.connected.load(Ordering::Relaxed));
+            *self.tray_connected_ok.lock().unwrap() = ok;
         }
         self.poll_overlay(ctx);
         // While the Meter tab is open the overlay force-renders a placeholder
@@ -1926,12 +1949,14 @@ fn main() -> eframe::Result<()> {
     let links = Arc::new(Mutex::new(Vec::new()));
     let watching = Arc::new(Mutex::new(0usize));
     let meter_on = Arc::new(Mutex::new(false));
+    let connected_ok = Arc::new(Mutex::new(true));
 
     let tray = Tray {
         art: TrayArt::load(),
         tx,
         links: Arc::clone(&links),
         watching: Arc::clone(&watching),
+        connected_ok: Arc::clone(&connected_ok),
         meter_on: Arc::clone(&meter_on),
     };
     // COSMIC hosts StatusNotifierItem, so this lands on the top bar
@@ -1988,6 +2013,7 @@ fn main() -> eframe::Result<()> {
         meter_view: meter_ui::MeterView::default(),
         meter_moved_at: None,
         meter_on,
+        tray_connected_ok: connected_ok,
         meter_preview: false,
     };
     app.sync_tray();
