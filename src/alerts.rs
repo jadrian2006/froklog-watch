@@ -12,7 +12,23 @@
 //! be turned down without touching the game.
 
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Master volume 0–100, applied to every sound and voice (paplay --volume,
+/// spd-say -i). Process-wide like the Windows client's audio atomics; the
+/// window syncs it from settings each frame.
+pub static VOLUME: AtomicU8 = AtomicU8::new(100);
+/// Master mute. Auditions (the Sounds tab's ▶ buttons, "Say a phrase")
+/// deliberately bypass it via the *_forced variants — you audition BECAUSE
+/// things are muted — matching the Windows client's preview behavior.
+pub static MUTED: AtomicBool = AtomicBool::new(false);
+
+/// paplay volume scale: 65536 = 100%.
+fn paplay_volume() -> String {
+    let v = VOLUME.load(Ordering::Relaxed).min(100) as u32;
+    format!("--volume={}", v * 65536 / 100)
+}
 
 use froklog::triggers::engine::{
     Action, Condition, OverlayEvent, TriggerConfig, TriggerDef, TriggerEngine, VoicePriority,
@@ -179,6 +195,14 @@ impl Alerts {
 /// at once. An absolute path is taken literally, for a sound that is not in a
 /// package at all.
 pub fn play(sound: &str, package: &str) -> Option<String> {
+    if MUTED.load(Ordering::Relaxed) {
+        return None;
+    }
+    play_forced(sound, package)
+}
+
+/// Play regardless of the mute switch (auditions). Volume still applies.
+pub fn play_forced(sound: &str, package: &str) -> Option<String> {
     if sound.is_empty() {
         return None;
     }
@@ -198,6 +222,7 @@ fn play_file(path: &std::path::Path) -> bool {
     let paplay = Command::new("paplay")
         .arg("--property=application.name=froklog watch")
         .arg("--property=media.role=event")
+        .arg(paplay_volume())
         .arg(path)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -499,6 +524,14 @@ static SPEAKING: Mutex<Option<std::process::Child>> = Mutex::new(None);
 /// losing the last one for. Ambient gives way instead: it is the trivia, and
 /// it should never talk over something that mattered. Operational just queues.
 pub fn speak(text: &str, priority: &VoicePriority, voice: &Voice) -> bool {
+    if MUTED.load(Ordering::Relaxed) {
+        return false;
+    }
+    speak_forced(text, priority, voice)
+}
+
+/// Speak regardless of the mute switch (auditions). Volume still applies.
+pub fn speak_forced(text: &str, priority: &VoicePriority, voice: &Voice) -> bool {
     if text.is_empty() {
         return false;
     }
@@ -513,8 +546,11 @@ pub fn speak(text: &str, priority: &VoicePriority, voice: &Voice) -> bool {
                 VoicePriority::Operational => "message",
                 VoicePriority::Ambient => "notification",
             };
+            // spd-say volume runs -100 (silent) to +100; the 0-100 slider
+            // maps onto the attenuation half so 100 stays the voice default.
+            let vol = (VOLUME.load(Ordering::Relaxed).min(100) as i32 - 100).to_string();
             Command::new("spd-say")
-                .args(["--priority", prio, "--application-name", "froklog-watch", "--", text])
+                .args(["--priority", prio, "-i", &vol, "--application-name", "froklog-watch", "--", text])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
@@ -569,6 +605,7 @@ fn speak_piper(text: &str, priority: &VoicePriority, model: &str) -> bool {
             "--format=s16le",
             "--channels=1",
             &format!("--rate={rate}"),
+            &paplay_volume(),
         ])
         .stdin(audio)
         .stdout(Stdio::null())

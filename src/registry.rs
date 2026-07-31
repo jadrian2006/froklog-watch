@@ -107,6 +107,12 @@ pub struct Settings {
     /// packages — so it belongs here, not in each trigger.
     #[serde(default = "default_sound_package")]
     pub sound_package: String,
+    /// Master volume 0–100 for every sound and voice.
+    #[serde(default = "default_sound_volume")]
+    pub sound_volume: u8,
+    /// Master mute. Auditions still play — that is what auditions are for.
+    #[serde(default)]
+    pub sound_muted: bool,
     /// Which text-to-speech engine speaks alerts: "speech-dispatcher" (always
     /// present, but robotic) or "piper" (neural, needs a voice model).
     #[serde(default = "default_voice")]
@@ -186,6 +192,10 @@ fn default_sound_package() -> String {
     "default".into()
 }
 
+fn default_sound_volume() -> u8 {
+    100
+}
+
 fn default_voice() -> String {
     "speech-dispatcher".into()
 }
@@ -207,6 +217,8 @@ impl Default for Settings {
             planner_url: default_planner(),
             triggers_enabled: false,
             sound_package: default_sound_package(),
+            sound_volume: default_sound_volume(),
+            sound_muted: false,
             voice_engine: default_voice(),
             piper_model: String::new(),
             meter_enabled: false,

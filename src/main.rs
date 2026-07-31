@@ -277,6 +277,11 @@ struct App {
     meter_preview: bool,
     /// monitor list for the Meter tab's picker, fetched when the tab opens
     monitors: Option<Vec<(String, String)>>,
+    /// Sounds tab scratch: armed package delete, import path, new-label form
+    pkg_delete_arm: bool,
+    import_zip: String,
+    new_label_name: String,
+    new_label_file: String,
 }
 
 /// The same artwork the tray uses, for the titlebar and dock entry.
@@ -809,6 +814,10 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
+        // Sync the process-wide audio state from settings so changes apply
+        // to the very next sound.
+        alerts::VOLUME.store(self.reg.settings.sound_volume, Ordering::Relaxed);
+        alerts::MUTED.store(self.reg.settings.sound_muted, Ordering::Relaxed);
         for line in self.lines_rx.try_iter().take(2000) {
             self.alerts.process_line(&line);
         }
@@ -1062,7 +1071,7 @@ impl eframe::App for App {
                             &self.reg.settings.voice_engine,
                             &self.reg.settings.piper_model,
                         );
-                        self.status = if alerts::speak(
+                        self.status = if alerts::speak_forced(
                             &self.phrase,
                             &froklog::triggers::engine::VoicePriority::Emergency,
                             &voice,
@@ -1121,7 +1130,7 @@ impl eframe::App for App {
                         ui.label(egui::RichText::new("voices").weak().small());
                         for (name, path) in &voices {
                             if ui.small_button(name).clicked() {
-                                alerts::speak(
+                                alerts::speak_forced(
                                     &self.phrase,
                                     &froklog::triggers::engine::VoicePriority::Emergency,
                                     &alerts::Voice::Piper { model: path },
@@ -1355,6 +1364,30 @@ impl eframe::App for App {
                     );
                     ui.add_space(6.0);
                     egui::Grid::new("sounds").num_columns(2).show(ui, |ui| {
+                    ui.label("volume");
+                    ui.horizontal(|ui| {
+                        let mut v = self.reg.settings.sound_volume;
+                        if ui
+                            .add(egui::Slider::new(&mut v, 0..=100).suffix("%"))
+                            .changed()
+                        {
+                            self.reg.settings.sound_volume = v;
+                            dirty = true;
+                        }
+                        let mut m = self.reg.settings.sound_muted;
+                        if ui
+                            .checkbox(&mut m, "mute")
+                            .on_hover_text(
+                                "Silence alerts and voice. The audition buttons \
+                                 still play — that is what auditioning is for.",
+                            )
+                            .changed()
+                        {
+                            self.reg.settings.sound_muted = m;
+                            dirty = true;
+                        }
+                    });
+                    ui.end_row();
                     ui.label("sound package");
                     // one name re-themes every trigger's sound, which is
                     // what packages are for
@@ -1382,6 +1415,135 @@ impl eframe::App for App {
                     }
                     ui.end_row();
                     });
+                    ui.add_space(4.0);
+
+                    // Package management — everything the Windows client's
+                    // Sounds tab does, minus file dialogs (COSMIC's portal
+                    // crashes on them): Import takes a typed path instead.
+                    {
+                        use froklog::sound_packages::sound_packages as sp;
+                        let active = self.reg.settings.sound_package.clone();
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button("New")
+                                .on_hover_text("Clone the active package under a new name")
+                                .clicked()
+                            {
+                                let name = sp::unique_package_name(&format!("{active} copy"));
+                                self.status = match sp::clone_package(&active, &name) {
+                                    Ok(()) => {
+                                        self.reg.settings.sound_package = name.clone();
+                                        dirty = true;
+                                        format!("created package {name}")
+                                    }
+                                    Err(e) => format!("clone failed: {e}"),
+                                };
+                            }
+                            if ui
+                                .button("Export")
+                                .on_hover_text("Write the active package to a zip in ~/Downloads")
+                                .clicked()
+                            {
+                                let dest = dirs::download_dir()
+                                    .unwrap_or_else(|| dirs::home_dir().unwrap_or_default())
+                                    .join(format!("froklog-sounds-{active}.zip"));
+                                self.status = match sp::export_package_zip(&active, &dest) {
+                                    Ok(()) => format!("exported to {}", dest.display()),
+                                    Err(e) => format!("export failed: {e}"),
+                                };
+                            }
+                            if active != "default" {
+                                if self.pkg_delete_arm {
+                                    if ui
+                                        .button(
+                                            egui::RichText::new("Really delete package?")
+                                                .color(egui::Color32::from_rgb(230, 90, 90)),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.pkg_delete_arm = false;
+                                        self.status = match sp::delete_package(&active) {
+                                            Ok(()) => {
+                                                self.reg.settings.sound_package =
+                                                    "default".into();
+                                                dirty = true;
+                                                format!("deleted package {active}")
+                                            }
+                                            Err(e) => format!("delete failed: {e}"),
+                                        };
+                                    }
+                                    if ui.small_button("cancel").clicked() {
+                                        self.pkg_delete_arm = false;
+                                    }
+                                } else if ui
+                                    .button("Delete")
+                                    .on_hover_text(
+                                        "Remove this package and its sounds. Asks once more. \
+                                         The default package cannot be deleted.",
+                                    )
+                                    .clicked()
+                                {
+                                    self.pkg_delete_arm = true;
+                                }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("import zip").weak().small());
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.import_zip)
+                                    .hint_text("/path/to/package.zip")
+                                    .desired_width(260.0),
+                            );
+                            if ui.button("Import").clicked() {
+                                let path = self.import_zip.trim().to_string();
+                                self.status = match sp::import_package_zip(std::path::Path::new(
+                                    &path,
+                                )) {
+                                    Ok(name) => {
+                                        self.reg.settings.sound_package = name.clone();
+                                        dirty = true;
+                                        self.import_zip.clear();
+                                        format!("imported package {name}")
+                                    }
+                                    Err(e) => format!("import failed: {e}"),
+                                };
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("add sound").weak().small());
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.new_label_name)
+                                    .hint_text("label")
+                                    .desired_width(90.0),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.new_label_file)
+                                    .hint_text("/path/to/sound.wav")
+                                    .desired_width(220.0),
+                            );
+                            if ui.button("Add").clicked() {
+                                let name = self.new_label_name.trim().to_string();
+                                let file = self.new_label_file.trim().to_string();
+                                if name.is_empty() || file.is_empty() {
+                                    self.status = "give the sound a label and a file".into();
+                                } else {
+                                    self.status = match sp::add_or_replace_label(
+                                        &active,
+                                        &name,
+                                        std::path::Path::new(&file),
+                                    ) {
+                                        Ok(()) => {
+                                            self.new_label_name.clear();
+                                            self.new_label_file.clear();
+                                            format!("added {name} to {active}")
+                                        }
+                                        Err(e) => format!("add failed: {e}"),
+                                    };
+                                }
+                            }
+                        });
+                    }
+
                     ui.add_space(6.0);
                 // Every sound the active package offers, playable on the spot.
                 let labels = alerts::labels(&self.reg.settings.sound_package);
@@ -1390,13 +1552,27 @@ impl eframe::App for App {
                         ui.label(egui::RichText::new("sounds").weak().small());
                         for label in &labels {
                             if ui.small_button(label).clicked() {
-                                self.status = match alerts::play(
+                                self.status = match alerts::play_forced(
                                     label,
                                     &self.reg.settings.sound_package,
                                 ) {
                                     Some(p) => format!("played {p}"),
                                     None => format!("{label}: no file in this package"),
                                 };
+                            }
+                            if ui
+                                .small_button(egui::RichText::new("×").weak())
+                                .on_hover_text(
+                                    "Remove this label from the package (the sound \
+                                     file itself is left on disk)",
+                                )
+                                .clicked()
+                            {
+                                froklog::sound_packages::sound_packages::delete_label(
+                                    &self.reg.settings.sound_package,
+                                    label,
+                                );
+                                self.status = format!("removed {label}");
                             }
                         }
                     });
@@ -1513,7 +1689,7 @@ impl eframe::App for App {
                             &self.reg.settings.voice_engine,
                             &self.reg.settings.piper_model,
                         );
-                        alerts::speak(
+                        alerts::speak_forced(
                             &text,
                             &froklog::triggers::engine::VoicePriority::Emergency,
                             &voice,
@@ -2080,6 +2256,10 @@ fn main() -> eframe::Result<()> {
         tray_connected_ok: connected_ok,
         meter_preview: false,
         monitors: None,
+        pkg_delete_arm: false,
+        import_zip: String::new(),
+        new_label_name: String::new(),
+        new_label_file: String::new(),
     };
     app.sync_tray();
     app.reconcile(); // pick up whatever was already ticked
