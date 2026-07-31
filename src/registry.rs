@@ -135,6 +135,12 @@ pub struct Settings {
     pub meter_idle_secs: u64,
     #[serde(default = "default_meter_font")]
     pub meter_font_size: f32,
+    /// Which monitor the meter lives on, as the compositor's connector name
+    /// ("DP-1"). Margins position a layer surface only WITHIN its output, so
+    /// without this the meter spawns on whichever monitor happens to be
+    /// focused. Empty = follow the focused monitor.
+    #[serde(default)]
+    pub meter_output: String,
     /// Random key stamped on every stream this install registers, linking
     /// them as one household on the server — powers the viewer's "another
     /// character is live" hint. Generated once, never shown, never secret
@@ -211,6 +217,7 @@ impl Default for Settings {
             meter_max_rows: default_meter_max_rows(),
             meter_idle_secs: default_meter_idle(),
             meter_font_size: default_meter_font(),
+            meter_output: String::new(),
             owner_key: String::new(),
         }
     }

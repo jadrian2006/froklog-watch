@@ -30,6 +30,9 @@ egui = "0.29"
 layershellev = "0.19"
 egui-wgpu = "0.29"
 pollster = "0.3"
+# monitor enumeration for the meter's output picker (layershellev can target
+# an output by name but not list them) — same version already in the tree
+wayland-client = "0.31"
 
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 serde = { version = "1", features = ["derive"] }

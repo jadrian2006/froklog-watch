@@ -93,6 +93,10 @@ pub fn preflight_instance() -> Arc<egui_wgpu::wgpu::Instance> {
 
 pub struct OverlaySpawn {
     pub instance: Arc<egui_wgpu::wgpu::Instance>,
+    /// Compositor connector name to spawn on ("DP-1"); empty = focused
+    /// monitor. Changing monitors is a respawn, not a runtime move — layer
+    /// surfaces are bound to one output for life.
+    pub output: String,
     pub feeds: Vec<Feed>,
     pub locked: bool,
     pub x: i32,
@@ -602,13 +606,19 @@ fn run(
     out: std_mpsc::Sender<OverlayEvent>,
 ) -> Result<(), String> {
     let height = surface_height(init.max_rows, init.font_size);
-    let ev: WindowState<()> = WindowState::new("froklog-meter")
+    let mut builder = WindowState::new("froklog-meter")
         .with_size((init.width, height))
         .with_layer(Layer::Overlay)
         .with_anchor(Anchor::Top | Anchor::Left)
         .with_margin((init.y, 0, 0, init.x))
         .with_keyboard_interacivity(KeyboardInteractivity::None)
-        .with_use_display_handle(true)
+        .with_use_display_handle(true);
+    if !init.output.is_empty() {
+        // Falls back to the focused monitor if the name no longer exists
+        // (monitor unplugged) — layershellev handles that gracefully.
+        builder = builder.with_xdg_output_name(init.output.clone());
+    }
+    let ev: WindowState<()> = builder
         .build()
         .map_err(|e| format!("layer-shell unavailable: {e}"))?;
 

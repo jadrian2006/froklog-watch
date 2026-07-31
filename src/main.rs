@@ -13,6 +13,7 @@ mod engine;
 mod icon;
 mod meter_core;
 mod meter_ui;
+mod outputs;
 mod overlay;
 mod registry;
 
@@ -274,6 +275,8 @@ struct App {
     tray_connected_ok: Arc<Mutex<bool>>,
     /// whether the overlay was last told to preview (Meter tab open)
     meter_preview: bool,
+    /// monitor list for the Meter tab's picker, fetched when the tab opens
+    monitors: Option<Vec<(String, String)>>,
 }
 
 /// The same artwork the tray uses, for the titlebar and dock entry.
@@ -337,6 +340,7 @@ impl App {
             if let (true, Some(instance)) = (wayland, self.meter_instance.clone()) {
                 self.overlay = Some(overlay::spawn(overlay::OverlaySpawn {
                     instance,
+                    output: s.meter_output.clone(),
                     feeds: self.overlay_feeds(),
                     locked: s.meter_locked,
                     x: s.meter_x,
@@ -1553,7 +1557,58 @@ impl eframe::App for App {
                     );
 
                     ui.add_space(6.0);
+                    // The picker exists because nothing else can move a layer
+                    // surface between monitors: it is bound to one output for
+                    // life and invisible to the compositor's window tools.
+                    let monitors = match &self.monitors {
+                        Some(m) => m.clone(),
+                        None => {
+                            let m = outputs::list();
+                            self.monitors = Some(m.clone());
+                            m
+                        }
+                    };
+                    let mut respawn_for_output = false;
                     egui::Grid::new("meter-settings").num_columns(2).show(ui, |ui| {
+                        ui.label("monitor");
+                        {
+                            let current = if s.meter_output.is_empty() {
+                                "(focused monitor)".to_string()
+                            } else {
+                                s.meter_output.clone()
+                            };
+                            egui::ComboBox::from_id_salt("meter-output")
+                                .selected_text(current)
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_label(s.meter_output.is_empty(), "(focused monitor)")
+                                        .clicked()
+                                        && !s.meter_output.is_empty()
+                                    {
+                                        s.meter_output.clear();
+                                        meter_dirty = true;
+                                        respawn_for_output = true;
+                                    }
+                                    for (name, desc) in &monitors {
+                                        let label = if desc.is_empty() {
+                                            name.clone()
+                                        } else {
+                                            format!("{name} — {desc}")
+                                        };
+                                        if ui
+                                            .selectable_label(s.meter_output == *name, label)
+                                            .clicked()
+                                            && s.meter_output != *name
+                                        {
+                                            s.meter_output = name.clone();
+                                            meter_dirty = true;
+                                            respawn_for_output = true;
+                                        }
+                                    }
+                                });
+                        }
+                        ui.end_row();
+
                         ui.label("position");
                         ui.horizontal(|ui| {
                             let mut x = s.meter_x;
@@ -1667,6 +1722,15 @@ impl eframe::App for App {
                     }
                     if style_dirty {
                         self.push_overlay_settings();
+                    }
+                    if respawn_for_output {
+                        // A layer surface cannot change outputs — controlled
+                        // single respawn; reconcile brings it back on the
+                        // newly chosen monitor.
+                        if let Some(o) = self.overlay.take() {
+                            let _ = o.tx.send(overlay::OverlayMsg::Quit);
+                        }
+                        self.status = "meter moving to the selected monitor…".into();
                     }
                     if resize {
                         // layer surfaces resize in place — never respawn here
@@ -2015,6 +2079,7 @@ fn main() -> eframe::Result<()> {
         meter_on,
         tray_connected_ok: connected_ok,
         meter_preview: false,
+        monitors: None,
     };
     app.sync_tray();
     app.reconcile(); // pick up whatever was already ticked
