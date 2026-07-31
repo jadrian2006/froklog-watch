@@ -1472,6 +1472,20 @@ impl eframe::App for App {
                             self.builder_pattern_auto.clear();
                         }
                         if ui
+                            .button("Clear")
+                            .on_hover_text("Reset the builder — line, picks, pattern, name, say")
+                            .clicked()
+                        {
+                            self.builder_line.clear();
+                            self.builder_chosen.clear();
+                            self.builder_wild.clear();
+                            self.builder_pattern.clear();
+                            self.builder_pattern_auto.clear();
+                            self.new_name.clear();
+                            self.new_say.clear();
+                            self.status = "builder cleared".into();
+                        }
+                        if ui
                             .button("Try it")
                             .on_hover_text(
                                 "Test the DRAFT above against this line — plays the \
