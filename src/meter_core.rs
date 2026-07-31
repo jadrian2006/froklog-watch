@@ -436,3 +436,63 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod live_probe {
+    use super::*;
+    use froklog::state::CombatState;
+    use std::sync::{atomic::AtomicBool, Arc};
+
+    /// Manual diagnostic, never run by default: replay the tail of a real
+    /// log through the real parser and report what each meter tab would
+    /// show. Answers "is the tab empty because the button is broken or
+    /// because there is no healing in this log?" — which is exactly the
+    /// question a dead-looking Heal tab raises.
+    ///
+    ///   PROBE_LOG=/path/to/eqlog.txt cargo test probe_tabs -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn probe_tabs_against_real_log() {
+        let path = std::env::var("PROBE_LOG").expect("PROBE_LOG");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let slice: Vec<String> = lines[lines.len().saturating_sub(4000)..]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let (ltx, lrx) = crossbeam_channel::unbounded();
+        for l in &slice {
+            ltx.send(l.clone()).unwrap();
+        }
+        drop(ltx);
+        let shared = Arc::new(arc_swap::ArcSwap::from_pointee(CombatState::default()));
+        let reset = Arc::new(AtomicBool::new(false));
+        let (btx, _brx) = tokio::sync::broadcast::channel(16);
+        let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
+        std::thread::spawn(move || while erx.blocking_recv().is_some() {});
+        froklog::parser::run(lrx, Arc::clone(&shared), reset, btx, etx, "Izzin".into());
+
+        let cs = shared.load();
+        println!("mob_list: {}", cs.mob_list.len());
+        println!(
+            "maps: damage={} tanking={} healing={} healed={}",
+            cs.mob_damage.len(),
+            cs.mob_tanking.len(),
+            cs.mob_healing.len(),
+            cs.mob_healed.len()
+        );
+        for m in cs.mob_list.iter().take(4) {
+            println!("--- mob {} '{}'", m.id, m.name);
+            for tab in MeterTab::ALL {
+                let snap = compute_snapshot(&cs, m.id, tab, 10);
+                println!(
+                    "   {:>5}: {} rows, total={}",
+                    tab.label(),
+                    snap.rows.len(),
+                    snap.footer_total
+                );
+            }
+        }
+    }
+}

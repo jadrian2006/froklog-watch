@@ -18,6 +18,10 @@ pub struct MeterView {
     pub tab: MeterTab,
     pub pinned: Option<u64>,
     pub picker_open: bool,
+    /// Last frame's title-bar rect. The drag handle has to be registered
+    /// BEFORE the widgets it covers (see `draw`), which means it can only
+    /// use a rect measured on the previous frame.
+    pub title_rect: egui::Rect,
 }
 
 impl Default for MeterView {
@@ -26,6 +30,7 @@ impl Default for MeterView {
             tab: MeterTab::Dps,
             pinned: None,
             picker_open: false,
+            title_rect: egui::Rect::NOTHING,
         }
     }
 }
@@ -134,15 +139,9 @@ pub fn draw(
     if resolved.is_none() {
         // Preview placeholder: title bar (draggable) + a hint, no data rows.
         let fs = style.font_size;
-        let title = ui
-            .horizontal(|ui| {
-                for tab in MeterTab::ALL.iter() {
-                    let _ = ui.selectable_label(view.tab == *tab, egui::RichText::new(tab.label()).size(fs - 1.0));
-                }
-            })
-            .response;
+        // Registered before the tabs, for the same reason as the live bar.
         let drag = ui.interact(
-            title.rect,
+            view.title_rect,
             ui.id().with("meter-drag-preview"),
             egui::Sense::drag(),
         );
@@ -152,6 +151,22 @@ pub fn draw(
                 actions.push(MeterAction::Drag(delta));
             }
         }
+        let title = ui
+            .horizontal(|ui| {
+                for tab in MeterTab::ALL.iter() {
+                    if ui
+                        .selectable_label(
+                            view.tab == *tab,
+                            egui::RichText::new(tab.label()).size(fs - 1.0),
+                        )
+                        .clicked()
+                    {
+                        view.tab = *tab;
+                    }
+                }
+            })
+            .response;
+        view.title_rect = title.rect;
         ui.separator();
         ui.label(
             egui::RichText::new("waiting for combat — drag this bar to position the meter")
@@ -170,6 +185,28 @@ pub fn draw(
     let fs = style.font_size;
     let text_col = Color32::from_rgb(228, 228, 234);
     let dim_col = Color32::from_rgb(150, 150, 160);
+
+    // The whole title bar doubles as the drag handle, like the Windows
+    // meter's caption area — but it MUST be registered before the widgets
+    // it covers. egui hit-tests in registration order and a drag-only
+    // widget on top of a click widget discards the click outright
+    // (hit_test.rs: "we ignore the click-widget, because it would be
+    // confusing if clicking a drag-widget would actually click something
+    // else below it"). Registered first it is *underneath*, so egui reports
+    // both, and the tabs and chrome icons stay clickable while the bar
+    // still drags. The rect is last frame's: `ui.interact` allocates no
+    // space, so nothing moves, and the bar's height is stable.
+    let drag = ui.interact(
+        view.title_rect,
+        ui.id().with("meter-drag"),
+        egui::Sense::drag(),
+    );
+    if drag.dragged() && !locked {
+        let delta = drag.drag_delta();
+        if delta != egui::Vec2::ZERO {
+            actions.push(MeterAction::Drag(delta));
+        }
+    }
 
     // ── Title bar: tabs left, chrome icons right — like the Windows meter,
     // the mob name lives in the footer, never up here. Locked keeps the
@@ -213,20 +250,7 @@ pub fn draw(
         })
         .response;
 
-    // The whole title bar doubles as the drag handle, like the Windows
-    // meter's caption area. Sense the rect explicitly: labels eat hover
-    // but not drag.
-    let drag = ui.interact(
-        title_resp.rect,
-        ui.id().with("meter-drag"),
-        egui::Sense::drag(),
-    );
-    if drag.dragged() && !locked {
-        let delta = drag.drag_delta();
-        if delta != egui::Vec2::ZERO {
-            actions.push(MeterAction::Drag(delta));
-        }
-    }
+    view.title_rect = title_resp.rect;
 
     ui.separator();
 
@@ -362,4 +386,71 @@ pub fn draw(
     }
 
     (actions, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use egui::{Event, Modifiers, PointerButton, Pos2, Rect, Sense, Vec2};
+
+    /// Run one egui pass, laying out a click widget and a drag handle over
+    /// the same rect in the given order. Returns the click widget's rect and
+    /// whether it registered a click.
+    fn pass(ctx: &egui::Context, events: Vec<Event>, handle: Rect, drag_first: bool) -> (Rect, bool) {
+        let mut clicked = false;
+        let mut rect = Rect::NOTHING;
+        let input = egui::RawInput {
+            events,
+            ..Default::default()
+        };
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                if drag_first {
+                    let _ = ui.interact(handle, ui.id().with("handle"), Sense::drag());
+                }
+                let r = ui.horizontal(|ui| {
+                    clicked = ui.selectable_label(false, "Tank").clicked();
+                });
+                rect = r.response.rect;
+                if !drag_first {
+                    let _ = ui.interact(rect, ui.id().with("handle"), Sense::drag());
+                }
+            });
+        });
+        (rect, clicked)
+    }
+
+    /// The meter's title bar is both a drag handle and a row of tab buttons.
+    /// egui hit-tests in registration order and DISCARDS a click when a
+    /// drag-only widget sits on top of the clicked widget, so registering
+    /// the handle after the tabs makes every tab and chrome icon dead while
+    /// looking perfectly normal. This is the shape of that bug, both ways
+    /// round, so a later tidy-up cannot quietly reintroduce it.
+    #[test]
+    fn a_drag_handle_registered_first_does_not_swallow_clicks() {
+        for drag_first in [true, false] {
+            let ctx = egui::Context::default();
+            // first pass: establish widget rects for the hit test
+            let (rect, _) = pass(&ctx, Vec::new(), Rect::NOTHING, drag_first);
+            let pos = rect.center();
+            let click = |pressed| Event::PointerButton {
+                pos,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers: Modifiers::default(),
+            };
+            let events = vec![Event::PointerMoved(pos), click(true), click(false)];
+            let (_, clicked) = pass(&ctx, events, rect, drag_first);
+            if drag_first {
+                assert!(clicked, "handle registered FIRST must leave the tab clickable");
+            } else {
+                assert!(
+                    !clicked,
+                    "handle registered LAST swallows the click — if this ever \
+                     starts passing, egui changed and the ordering comment in \
+                     draw() should be revisited"
+                );
+            }
+        }
+        let _ = (Pos2::ZERO, Vec2::ZERO);
+    }
 }

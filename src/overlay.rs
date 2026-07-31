@@ -807,6 +807,11 @@ fn run(
                                     });
                                 }
                                 app.render(ev);
+                                // What the click changed (the tab, say) was
+                                // decided after this frame's rows were built,
+                                // so paint once more or the effect shows up a
+                                // whole tick late and reads as a dead button.
+                                app.render(ev);
                             }
                             return ReturnData::None;
                         }
