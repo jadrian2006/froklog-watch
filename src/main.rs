@@ -214,6 +214,10 @@ struct App {
     imports: BTreeMap<String, (Arc<std::sync::atomic::AtomicBool>, Arc<std::sync::atomic::AtomicU64>)>,
     /// publish flips in flight: key -> the new value, or why it failed
     publishing: Arc<Mutex<BTreeMap<String, Result<bool, String>>>>,
+    /// stream deletions: key -> None while running, Some(outcome) when done
+    deleting: Arc<Mutex<BTreeMap<String, Option<Result<(), String>>>>>,
+    /// character whose Delete button is armed, waiting for the second click
+    delete_arm: Option<String>,
     /// his trigger engine, wired to Linux audio
     alerts: alerts::Alerts,
     /// pipelines must be rebuilt to start or stop feeding the engine
@@ -601,6 +605,58 @@ impl App {
         );
     }
 
+    fn delete(&mut self, key: String) {
+        let Some(ch) = self.reg.characters.get(&key).cloned() else {
+            return;
+        };
+        let settings = self.reg.settings.clone();
+        let deleting = Arc::clone(&self.deleting);
+        self.deleting.lock().unwrap().insert(key.clone(), None);
+        self.rt.spawn(async move {
+            let res = engine::delete_stream(&settings, &ch)
+                .await
+                .map_err(|e| e.to_string());
+            deleting.lock().unwrap().insert(key, Some(res));
+        });
+        self.status = "deleting stream…".into();
+    }
+
+    fn collect_deletes(&mut self) {
+        let done: Vec<(String, Result<(), String>)> = {
+            let mut d = self.deleting.lock().unwrap();
+            let finished: Vec<String> = d
+                .iter()
+                .filter(|(_, v)| v.is_some())
+                .map(|(k, _)| k.clone())
+                .collect();
+            finished
+                .into_iter()
+                .filter_map(|k| d.remove(&k).flatten().map(|r| (k, r)))
+                .collect()
+        };
+        if done.is_empty() {
+            return;
+        }
+        for (key, res) in done {
+            match res {
+                Ok(()) => {
+                    if let Some(c) = self.reg.characters.get_mut(&key) {
+                        c.stream_id = None;
+                        c.stream_token = None;
+                        c.view_token = None;
+                        c.enabled = false;
+                        c.public = false;
+                        c.imported = false;
+                    }
+                    self.status = format!("{key}: stream and history deleted");
+                }
+                Err(e) => self.status = format!("{key}: delete failed — {e}"),
+            }
+        }
+        self.save();
+        self.reconcile();
+    }
+
     fn collect_publish(&mut self) {
         let done: Vec<(String, Result<bool, String>)> = {
             let mut p = self.publishing.lock().unwrap();
@@ -738,6 +794,7 @@ impl eframe::App for App {
         self.collect_registrations();
         self.collect_imports();
         self.collect_publish();
+        self.collect_deletes();
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("froklog watch");
@@ -773,6 +830,7 @@ impl eframe::App for App {
             let mut to_register: Option<String> = None;
             let mut to_import: Option<String> = None;
             let mut to_publish: Option<(String, bool)> = None;
+            let mut to_delete: Option<String> = None;
             let mut to_copy: Option<String> = None;
             let mut open_url: Option<String> = None;
 
@@ -1709,6 +1767,38 @@ impl eframe::App for App {
                                         to_publish = Some((key.clone(), on));
                                     }
                                 }
+                                // Retiring an old character: two clicks, because this
+                                // erases the stream AND its whole server-side history.
+                                if self.deleting.lock().unwrap().contains_key(&key) {
+                                    ui.label(egui::RichText::new("deleting…").weak());
+                                } else if self.delete_arm.as_deref() == Some(key.as_str()) {
+                                    if ui
+                                        .button(
+                                            egui::RichText::new("Really erase history?")
+                                                .color(egui::Color32::from_rgb(230, 90, 90)),
+                                        )
+                                        .on_hover_text(
+                                            "Deletes this stream and its entire journal from \
+                                             the server. The local log file is untouched.",
+                                        )
+                                        .clicked()
+                                    {
+                                        self.delete_arm = None;
+                                        to_delete = Some(key.clone());
+                                    }
+                                    if ui.small_button("cancel").clicked() {
+                                        self.delete_arm = None;
+                                    }
+                                } else if ui
+                                    .button("Delete stream")
+                                    .on_hover_text(
+                                        "Remove this character's stream from the server, \
+                                         including all its history. Asks once more.",
+                                    )
+                                    .clicked()
+                                {
+                                    self.delete_arm = Some(key.clone());
+                                }
                             }
                         });
 
@@ -1786,6 +1876,9 @@ impl eframe::App for App {
             if let Some((k, want)) = to_publish {
                 self.set_public(k, want);
             }
+            if let Some(k) = to_delete {
+                self.delete(k);
+            }
             if let Some(k) = to_copy {
                 self.status = format!("{k}: link copied");
             }
@@ -1807,11 +1900,27 @@ impl eframe::App for App {
 }
 
 fn main() -> eframe::Result<()> {
-    let reg = Registry::load();
+    let mut reg = Registry::load();
+    // One household key per install, minted on first run: every stream this
+    // client registers carries it, which is how the server knows the user's
+    // characters are siblings (the viewer's "another character is live" hint).
+    if reg.settings.owner_key.is_empty() {
+        reg.settings.owner_key = registry::generate_owner_key();
+        let _ = reg.save();
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("tokio runtime");
+
+    // Backfill the key onto streams registered before it existed. Fire and
+    // forget: idempotent PATCHes with the per-stream tokens.
+    for ch in reg.characters.values().filter(|c| c.registered()).cloned() {
+        let settings = reg.settings.clone();
+        rt.spawn(async move {
+            let _ = engine::backfill_owner_key(&settings, &ch).await;
+        });
+    }
 
     let (tx, rx) = crossbeam_channel::unbounded();
     let links = Arc::new(Mutex::new(Vec::new()));
@@ -1853,6 +1962,8 @@ fn main() -> eframe::Result<()> {
         busy: Arc::new(Mutex::new(Vec::new())),
         imports: BTreeMap::new(),
         publishing: Arc::new(Mutex::new(BTreeMap::new())),
+        deleting: Arc::new(Mutex::new(BTreeMap::new())),
+        delete_arm: None,
         alerts: alerts::Alerts::load(reg_triggers_enabled),
         restart_watching: false,
         // an unconfigured install has nothing to show on the other two tabs

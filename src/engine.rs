@@ -38,6 +38,7 @@ pub async fn register(settings: &Settings, ch: &Character) -> Result<(String, St
         "server": ch.server,
         "player": ch.player,
         "public_stream": ch.public,
+        "owner_key": settings.owner_key,
     });
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
@@ -89,6 +90,61 @@ pub async fn set_public(settings: &Settings, ch: &Character, public: bool) -> Re
         .await
         .with_context(|| format!("PATCH {url}"))?;
     if !resp.status().is_success() {
+        let code = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("froklog said {code}: {}", text.trim()));
+    }
+    Ok(())
+}
+
+/// Stamp the household link onto an already-registered stream (streams from
+/// before owner_key existed). Idempotent; authenticated with the stream's
+/// own token.
+pub async fn backfill_owner_key(settings: &Settings, ch: &Character) -> Result<()> {
+    let (Some(id), Some(token)) = (&ch.stream_id, &ch.stream_token) else {
+        return Ok(());
+    };
+    let url = format!("{}/stream/{}", settings.server_url.trim_end_matches('/'), id);
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .unwrap_or_default()
+        .patch(&url)
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "owner_key": settings.owner_key }))
+        .send()
+        .await
+        .with_context(|| format!("PATCH {url}"))?;
+    Ok(())
+}
+
+/// Delete the stream from the server INCLUDING its journal database and all
+/// history — the retirement path for old characters. Authenticated with the
+/// stream's own token. 404 counts as success: the stream is already gone.
+pub async fn delete_stream(settings: &Settings, ch: &Character) -> Result<()> {
+    let id = ch
+        .stream_id
+        .as_ref()
+        .ok_or_else(|| anyhow!("character is not registered"))?;
+    let token = ch
+        .stream_token
+        .as_ref()
+        .ok_or_else(|| anyhow!("character has no stream token"))?;
+    let url = format!(
+        "{}/stream/{}/purge",
+        settings.server_url.trim_end_matches('/'),
+        id
+    );
+    let resp = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .unwrap_or_default()
+        .delete(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .with_context(|| format!("DELETE {url}"))?;
+    if !resp.status().is_success() && resp.status() != reqwest::StatusCode::NOT_FOUND {
         let code = resp.status();
         let text = resp.text().await.unwrap_or_default();
         return Err(anyhow!("froklog said {code}: {}", text.trim()));

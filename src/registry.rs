@@ -135,6 +135,29 @@ pub struct Settings {
     pub meter_idle_secs: u64,
     #[serde(default = "default_meter_font")]
     pub meter_font_size: f32,
+    /// Random key stamped on every stream this install registers, linking
+    /// them as one household on the server — powers the viewer's "another
+    /// character is live" hint. Generated once, never shown, never secret
+    /// (it grants nothing by itself).
+    #[serde(default)]
+    pub owner_key: String,
+}
+
+/// 32 hex chars from the kernel's RNG. Only called once per install.
+pub fn generate_owner_key() -> String {
+    let mut buf = [0u8; 16];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf))
+        .is_err()
+    {
+        // Fallback: time-derived, still unique enough for a household link.
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        return format!("{t:032x}");
+    }
+    buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn default_meter_pos() -> i32 {
@@ -188,6 +211,7 @@ impl Default for Settings {
             meter_max_rows: default_meter_max_rows(),
             meter_idle_secs: default_meter_idle(),
             meter_font_size: default_meter_font(),
+            owner_key: String::new(),
         }
     }
 }
