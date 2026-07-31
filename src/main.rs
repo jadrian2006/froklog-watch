@@ -251,6 +251,8 @@ struct App {
     builder_pattern_auto: String,
     /// trigger index whose × is armed, waiting for the second click
     trigger_delete_arm: Option<usize>,
+    /// trigger being edited in the builder — Some means Create becomes Save
+    edit_index: Option<usize>,
     new_name: String,
     new_sound: String,
     new_say: String,
@@ -1304,7 +1306,33 @@ impl eframe::App for App {
                     });
                 ui.add_space(4.0);
 
-                ui.label(egui::RichText::new("Build a trigger from a log line").strong());
+                match self.edit_index {
+                    None => {
+                        ui.label(
+                            egui::RichText::new("Build a trigger from a log line").strong(),
+                        );
+                    }
+                    Some(_) => {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Editing \u{201c}{}\u{201d}",
+                                self.new_name
+                            ))
+                            .strong()
+                            .color(egui::Color32::from_rgb(120, 190, 250)),
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                "Edit the pattern below, or paste a line and click \
+                                 Try it to check it. Clicking a word rebuilds the \
+                                 pattern from that line and replaces what was loaded.",
+                            )
+                            .small()
+                            .weak()
+                            .italics(),
+                        );
+                    }
+                }
                 if ui
                     .add(
                         egui::TextEdit::singleline(&mut self.builder_line)
@@ -1320,6 +1348,11 @@ impl eframe::App for App {
                 let stripped = alerts::builder::strip_timestamp(&self.builder_line).to_string();
                 if !stripped.is_empty() {
                     let tokens = alerts::builder::tokenize(&stripped);
+                    // While editing an existing trigger, a pasted line is a
+                    // line to TEST against, not a line to rebuild from — the
+                    // pattern came from the file. Only an actual word click
+                    // says "regenerate over what I loaded".
+                    let mut word_click = false;
                     ui.horizontal_wrapped(|ui| {
                         ui.label(
                             egui::RichText::new(
@@ -1355,6 +1388,7 @@ impl eframe::App for App {
                                 }
                             };
                             if ui.selectable_label(chosen || wild, label).clicked() {
+                                word_click = true;
                                 if chosen {
                                     self.builder_chosen.remove(&i);
                                     self.builder_wild.insert(i);
@@ -1375,7 +1409,9 @@ impl eframe::App for App {
                     let auto = alerts::builder::regex(&tokens, &self.builder_chosen, &self.builder_wild);
                     if auto != self.builder_pattern_auto {
                         self.builder_pattern_auto = auto.clone();
-                        self.builder_pattern = auto;
+                        if self.edit_index.is_none() || word_click {
+                            self.builder_pattern = auto;
+                        }
                     }
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("pattern").weak().small());
@@ -1450,19 +1486,39 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         let ready = !self.new_name.trim().is_empty()
                             && (!self.new_sound.is_empty() || !self.new_say.trim().is_empty());
+                        let save_label = match self.edit_index {
+                            Some(_) => "Save changes",
+                            None => "Create trigger",
+                        };
                         if ui
-                            .add_enabled(ready, egui::Button::new("Create trigger"))
-                            .on_hover_text("Adds it to triggers.toml and starts matching now")
+                            .add_enabled(ready, egui::Button::new(save_label))
+                            .on_hover_text("Writes it to triggers.toml and starts matching now")
                             .on_disabled_hover_text("Needs a name, and a sound or something to say")
                             .clicked()
                         {
-                            self.alerts.add_trigger(
-                                self.new_name.trim(),
-                                self.builder_pattern.trim(),
-                                &self.new_sound,
-                                self.new_say.trim(),
-                            );
-                            self.status = format!("added \"{}\"", self.new_name.trim());
+                            match self.edit_index {
+                                Some(i) => {
+                                    self.alerts.update_trigger(
+                                        i,
+                                        self.new_name.trim(),
+                                        self.builder_pattern.trim(),
+                                        &self.new_sound,
+                                        self.new_say.trim(),
+                                    );
+                                    self.status =
+                                        format!("saved \"{}\"", self.new_name.trim());
+                                }
+                                None => {
+                                    self.alerts.add_trigger(
+                                        self.new_name.trim(),
+                                        self.builder_pattern.trim(),
+                                        &self.new_sound,
+                                        self.new_say.trim(),
+                                    );
+                                    self.status = format!("added \"{}\"", self.new_name.trim());
+                                }
+                            }
+                            self.edit_index = None;
                             self.new_name.clear();
                             self.new_say.clear();
                             self.builder_chosen.clear();
@@ -1471,11 +1527,17 @@ impl eframe::App for App {
                             self.builder_pattern.clear();
                             self.builder_pattern_auto.clear();
                         }
+                        let clear_label = match self.edit_index {
+                            Some(_) => "Cancel edit",
+                            None => "Clear",
+                        };
                         if ui
-                            .button("Clear")
+                            .button(clear_label)
                             .on_hover_text("Reset the builder — line, picks, pattern, name, say")
                             .clicked()
                         {
+                            let was_editing = self.edit_index.is_some();
+                            self.edit_index = None;
                             self.builder_line.clear();
                             self.builder_chosen.clear();
                             self.builder_wild.clear();
@@ -1483,7 +1545,11 @@ impl eframe::App for App {
                             self.builder_pattern_auto.clear();
                             self.new_name.clear();
                             self.new_say.clear();
-                            self.status = "builder cleared".into();
+                            self.status = if was_editing {
+                                "edit cancelled — trigger left as it was".into()
+                            } else {
+                                "builder cleared".into()
+                            };
                         }
                         if ui
                             .button("Try it")
@@ -1559,6 +1625,7 @@ impl eframe::App for App {
                 let mut toggle: Option<(usize, bool)> = None;
                 let mut test: Option<(usize, String)> = None;
                 let mut delete: Option<usize> = None;
+                let mut edit: Option<usize> = None;
                 if self.alerts.count() == 0 {
                     ui.label(
                         egui::RichText::new("No triggers yet \u{2014} Edit triggers\u{2026} to write one.")
@@ -1576,7 +1643,31 @@ impl eframe::App for App {
                         {
                             toggle = Some((i, on));
                         }
-                        ui.label(egui::RichText::new(&t.name).strong());
+                        let name_txt = egui::RichText::new(&t.name).strong();
+                        ui.label(if self.edit_index == Some(i) {
+                            name_txt.color(egui::Color32::from_rgb(120, 190, 250))
+                        } else {
+                            name_txt
+                        });
+                        if self.edit_index == Some(i) {
+                            ui.label(
+                                egui::RichText::new("(editing above)")
+                                    .small()
+                                    .weak()
+                                    .italics(),
+                            );
+                        }
+                        if ui
+                            .small_button("edit")
+                            .on_hover_text(
+                                "Load this trigger into the builder above so its \
+                                 pattern, sound and speech can be changed and saved \
+                                 back over it",
+                            )
+                            .clicked()
+                        {
+                            edit = Some(i);
+                        }
                         if ui
                             .small_button("test")
                             .on_hover_text(
@@ -1647,6 +1738,40 @@ impl eframe::App for App {
                         .unwrap_or_default();
                     self.alerts.delete_trigger(i);
                     self.status = format!("deleted \"{name}\"");
+                    if self.edit_index == Some(i) {
+                        self.edit_index = None;
+                    }
+                }
+                if let Some(i) = edit {
+                    match self.alerts.parts(i) {
+                        Some((name, pattern, sound, say)) => {
+                            self.edit_index = Some(i);
+                            self.new_name = name.clone();
+                            self.new_sound = sound;
+                            self.new_say = say;
+                            // The word picker starts empty: this pattern came
+                            // from the file, not from a line, and letting the
+                            // generator run would overwrite it on the next
+                            // frame. Parking `_auto` on the empty-line result
+                            // keeps it quiet until a word is actually clicked.
+                            self.builder_line.clear();
+                            self.builder_chosen.clear();
+                            self.builder_wild.clear();
+                            self.builder_pattern_auto = alerts::builder::regex(
+                                &[],
+                                &self.builder_chosen,
+                                &self.builder_wild,
+                            );
+                            self.builder_pattern = pattern;
+                            self.status = format!("editing \"{name}\" — Save changes when done");
+                        }
+                        None => {
+                            self.status = "that trigger is richer than the builder \
+                                           (several conditions or actions) — use \
+                                           Edit triggers\u{2026} instead"
+                                .into();
+                        }
+                    }
                 }
 
                 if !self.alerts.recent.is_empty() {
@@ -2554,6 +2679,7 @@ fn main() -> eframe::Result<()> {
         builder_pattern: String::new(),
         builder_pattern_auto: String::new(),
         trigger_delete_arm: None,
+        edit_index: None,
         new_name: String::new(),
         new_sound: "Ding".into(),
         new_say: String::new(),

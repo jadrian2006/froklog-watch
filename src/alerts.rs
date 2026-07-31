@@ -173,6 +173,78 @@ impl Alerts {
         self.engine.reload(&self.cfg);
     }
 
+    /// Pull an existing trigger back apart into the four fields the builder
+    /// edits — name, pattern, sound label, spoken text. A trigger written by
+    /// hand can hold more than that (several conditions, overlay actions), so
+    /// only the first match condition and the first sound/voice action come
+    /// back; `parts` returning None means "too rich for the builder, use the
+    /// text editor" rather than silently dropping the rest on save.
+    pub fn parts(&self, index: usize) -> Option<(String, String, String, String)> {
+        let t = self.cfg.triggers.get(index)?;
+        if t.conditions.len() > 1 {
+            return None;
+        }
+        let pattern = match t.conditions.first()? {
+            Condition::Match {
+                match_type: froklog::triggers::engine::MatchType::Regex,
+                pattern,
+            } => pattern.clone(),
+            _ => return None,
+        };
+        let mut sound = String::new();
+        let mut say = String::new();
+        for a in &t.actions {
+            match a {
+                Action::PlaySound { sound: Some(s), .. } if sound.is_empty() => {
+                    sound = s.clone()
+                }
+                Action::VoiceAlert { tts_text, .. } if say.is_empty() => say = tts_text.clone(),
+                Action::PlaySound { .. } | Action::VoiceAlert { .. } => return None,
+                Action::Overlay { .. } | Action::StoreVar { .. } => return None,
+            }
+        }
+        Some((t.name.clone(), pattern, sound, say))
+    }
+
+    /// Replace a trigger in place. Keeps its position in the list and its
+    /// enabled state, so editing a live trigger does not silently re-enable
+    /// one that was ticked off, and preserves the voice priority already set.
+    pub fn update_trigger(&mut self, index: usize, name: &str, pattern: &str, sound: &str, say: &str) {
+        let Some(old) = self.cfg.triggers.get(index) else {
+            return;
+        };
+        let priority = old
+            .actions
+            .iter()
+            .find_map(|a| match a {
+                Action::VoiceAlert { priority, .. } => Some(priority.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let mut actions = Vec::new();
+        if !sound.is_empty() {
+            actions.push(Action::PlaySound {
+                sound: Some(sound.to_string()),
+                delay_secs: 0.0,
+            });
+        }
+        if !say.is_empty() {
+            actions.push(Action::VoiceAlert {
+                tts_text: say.to_string(),
+                priority,
+            });
+        }
+        let t = &mut self.cfg.triggers[index];
+        t.name = name.to_string();
+        t.conditions = vec![Condition::Match {
+            match_type: froklog::triggers::engine::MatchType::Regex,
+            pattern: pattern.to_string(),
+        }];
+        t.actions = actions;
+        self.cfg.save();
+        self.engine.reload(&self.cfg);
+    }
+
     /// Run a line as if the game had just logged it, so a trigger can be heard
     /// before the fight that needs it.
     pub fn test_line(&self, line: &str) {
@@ -804,6 +876,64 @@ mod tests {
         alerts.test_line(line);
         alerts.pump("default", &Voice::SpeechDispatcher);
         assert!(!alerts.recent.is_empty(), "the trigger should have fired");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Editing an existing trigger: it comes back apart into the builder's
+    /// four fields, a broadened pattern saves over it in place, and the new
+    /// pattern is what fires. This is the over-literal-pattern repair the
+    /// builder exists for — the mob name and damage number were baked in.
+    #[test]
+    #[ignore] // rewrites HOME; run alone: cargo test edits_a_trigger -- --ignored
+    fn edits_a_trigger_in_place() {
+        let tmp = std::env::temp_dir().join("froklog-watch-edittrigger");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("HOME", &tmp);
+
+        let mut alerts = Alerts::load(true);
+        alerts.add_trigger(
+            "Critical",
+            r"^You (\w+) Emperor Crush for 37 points of damage\. \((\w+)\)",
+            "",
+            "Critical",
+        );
+        alerts.set_enabled(0, false);
+
+        // it comes back apart the way the builder needs it
+        let (name, pattern, sound, say) = alerts.parts(0).expect("builder can hold it");
+        assert_eq!(name, "Critical");
+        assert_eq!(say, "Critical");
+        assert!(sound.is_empty());
+        assert!(pattern.contains("Emperor Crush"), "{pattern}");
+
+        // broaden it the way the word picker's * state would
+        alerts.update_trigger(
+            0,
+            "Critical",
+            r"^You (\w+) .+? for \d+ points of damage\. \(Critical\)",
+            "",
+            "{1}",
+        );
+        assert_eq!(alerts.count(), 1, "edit replaces, it does not append");
+        assert!(
+            !alerts.triggers()[0].enabled,
+            "editing must not silently re-enable a trigger that was ticked off"
+        );
+
+        // and the edit is what is on disk and what matches now
+        let reread = TriggerConfig::load();
+        assert_eq!(reread.triggers.len(), 1);
+        alerts.set_enabled(0, true);
+        alerts.test_line(builder::strip_timestamp(
+            "[Fri Jul 31 08:50:05 2026] You smite a greater skeleton for 47 points of damage. (Critical)",
+        ));
+        alerts.pump("default", &Voice::SpeechDispatcher);
+        assert!(
+            !alerts.recent.is_empty(),
+            "the broadened trigger should fire on a different mob and damage"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
