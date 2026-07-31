@@ -11,6 +11,7 @@ mod alerts;
 mod autostart;
 mod engine;
 mod icon;
+mod logscan;
 mod meter_core;
 mod meter_ui;
 mod outputs;
@@ -277,6 +278,10 @@ struct App {
     meter_preview: bool,
     /// monitor list for the Meter tab's picker, fetched when the tab opens
     monitors: Option<Vec<(String, String)>>,
+    /// Triggers tab scratch: log search text and results, template scan
+    log_search: String,
+    log_results: Vec<String>,
+    log_templates: Vec<(u32, String)>,
     /// Sounds tab scratch: armed package delete, import path, new-label form
     pkg_delete_arm: bool,
     import_zip: String,
@@ -1148,6 +1153,148 @@ impl eframe::App for App {
                 // in, and forgetting to escape punctuation. Both are handled
                 // for you — paste a line, click the words that change.
                 ui.separator();
+                // ── Trigger material: mine the real log instead of guessing ──
+                egui::CollapsingHeader::new("Find a line in your log")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "Search your newest log (chat excluded) or list every \
+                                 kind of message it contains. Click a line to load it \
+                                 into the builder below.",
+                            )
+                            .weak()
+                            .small(),
+                        );
+                        let newest_log = self
+                            .reg
+                            .characters
+                            .values()
+                            .filter_map(|c| {
+                                let p = std::path::PathBuf::from(&c.log_path);
+                                let t = std::fs::metadata(&p).and_then(|m| m.modified()).ok()?;
+                                Some((t, p))
+                            })
+                            .max_by_key(|(t, _)| *t)
+                            .map(|(_, p)| p);
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.log_search)
+                                    .hint_text("e.g. Critical, stunned, resisted")
+                                    .desired_width(220.0),
+                            );
+                            if ui.button("Search").clicked() {
+                                if let Some(log) = &newest_log {
+                                    self.log_results =
+                                        logscan::search(log, self.log_search.trim(), 15);
+                                    self.status = format!(
+                                        "{} unique line(s) in {}",
+                                        self.log_results.len(),
+                                        log.file_name().unwrap_or_default().to_string_lossy()
+                                    );
+                                }
+                            }
+                            if ui
+                                .button("Scan for message types")
+                                .on_hover_text(
+                                    "Every distinct non-chat message shape in the log, \
+                                     most frequent first (numbers collapsed)",
+                                )
+                                .clicked()
+                            {
+                                if let Some(log) = &newest_log {
+                                    self.log_templates = logscan::unique_templates(log, 60);
+                                    self.status = format!(
+                                        "{} message shapes found",
+                                        self.log_templates.len()
+                                    );
+                                }
+                            }
+                        });
+                        let mut seed: Option<String> = None;
+                        if !self.log_results.is_empty() {
+                            egui::ScrollArea::vertical()
+                                .id_salt("log-search-results")
+                                .max_height(140.0)
+                                .show(ui, |ui| {
+                                    for line in &self.log_results {
+                                        if ui
+                                            .selectable_label(
+                                                false,
+                                                egui::RichText::new(line).small().monospace(),
+                                            )
+                                            .clicked()
+                                        {
+                                            seed = Some(line.clone());
+                                        }
+                                    }
+                                });
+                        }
+                        if !self.log_templates.is_empty() {
+                            egui::ScrollArea::vertical()
+                                .id_salt("log-templates")
+                                .max_height(200.0)
+                                .show(ui, |ui| {
+                                    for (count, example) in &self.log_templates {
+                                        if ui
+                                            .selectable_label(
+                                                false,
+                                                egui::RichText::new(format!(
+                                                    "{count:>5}×  {example}"
+                                                ))
+                                                .small()
+                                                .monospace(),
+                                            )
+                                            .clicked()
+                                        {
+                                            seed = Some(example.clone());
+                                        }
+                                    }
+                                });
+                        }
+                        if let Some(line) = seed {
+                            self.builder_line = line;
+                            self.builder_chosen.clear();
+                            self.status = "line loaded into the builder".into();
+                        }
+                    });
+                egui::CollapsingHeader::new("Message shapes the parser knows")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "Reference examples for common combat lines — note the \
+                                 crit is a suffix on the hit line, not its own message. \
+                                 Click one to load it into the builder.",
+                            )
+                            .weak()
+                            .small(),
+                        );
+                        let mut seed: Option<String> = None;
+                        for (label, example) in logscan::KNOWN_SHAPES {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(*label).weak().small(),
+                                );
+                                if ui
+                                    .selectable_label(
+                                        false,
+                                        egui::RichText::new(*example).small().monospace(),
+                                    )
+                                    .clicked()
+                                {
+                                    seed = Some(example.to_string());
+                                }
+                            });
+                        }
+                        if let Some(line) = seed {
+                            self.builder_line = line;
+                            self.builder_chosen.clear();
+                            self.status = "example loaded into the builder".into();
+                        }
+                    });
+                ui.add_space(4.0);
+
                 ui.label(egui::RichText::new("Build a trigger from a log line").strong());
                 if ui
                     .add(
@@ -2256,6 +2403,9 @@ fn main() -> eframe::Result<()> {
         tray_connected_ok: connected_ok,
         meter_preview: false,
         monitors: None,
+        log_search: String::new(),
+        log_results: Vec::new(),
+        log_templates: Vec::new(),
         pkg_delete_arm: false,
         import_zip: String::new(),
         new_label_name: String::new(),
