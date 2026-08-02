@@ -39,6 +39,7 @@ pub async fn register(settings: &Settings, ch: &Character) -> Result<(String, St
         "player": ch.player,
         "public_stream": ch.public,
         "owner_key": settings.owner_key,
+        "home_token": settings.home_token,
     });
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
@@ -97,9 +98,9 @@ pub async fn set_public(settings: &Settings, ch: &Character, public: bool) -> Re
     Ok(())
 }
 
-/// Stamp the household link onto an already-registered stream (streams from
-/// before owner_key existed). Idempotent; authenticated with the stream's
-/// own token.
+/// Stamp the household link and front-door secret onto an already-registered
+/// stream (streams from before they existed). Idempotent; authenticated with
+/// the stream's own token.
 pub async fn backfill_owner_key(settings: &Settings, ch: &Character) -> Result<()> {
     let (Some(id), Some(token)) = (&ch.stream_id, &ch.stream_token) else {
         return Ok(());
@@ -111,7 +112,10 @@ pub async fn backfill_owner_key(settings: &Settings, ch: &Character) -> Result<(
         .unwrap_or_default()
         .patch(&url)
         .bearer_auth(token)
-        .json(&serde_json::json!({ "owner_key": settings.owner_key }))
+        .json(&serde_json::json!({
+            "owner_key": settings.owner_key,
+            "home_token": settings.home_token,
+        }))
         .send()
         .await
         .with_context(|| format!("PATCH {url}"))?;

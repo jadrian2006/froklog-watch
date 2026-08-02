@@ -178,6 +178,12 @@ pub struct Settings {
     /// (it grants nothing by itself).
     #[serde(default)]
     pub owner_key: String,
+    /// Secret for this install's front door — `<server>/home?key=…` lists
+    /// every character streamed from here. Kept SEPARATE from owner_key:
+    /// that one is a grouping id that grants nothing, and giving it this
+    /// power would have turned a non-secret into a password.
+    #[serde(default)]
+    pub home_token: String,
 }
 
 /// 32 hex chars from the kernel's RNG. Only called once per install.
@@ -285,6 +291,7 @@ impl Default for Settings {
             msg_history_rows: default_msg_rows(),
             msg_idle_secs: default_msg_idle(),
             owner_key: String::new(),
+            home_token: String::new(),
         }
     }
 }

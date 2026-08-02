@@ -352,6 +352,20 @@ impl App {
         self.sync_tray();
     }
 
+    /// This install's front door. Empty until a character is registered:
+    /// the page only exists once the server has a stream carrying the token.
+    fn home_url(&self) -> String {
+        let s = &self.reg.settings;
+        if s.home_token.is_empty() || !self.reg.characters.values().any(|c| c.registered()) {
+            return String::new();
+        }
+        format!(
+            "{}/home?key={}",
+            s.server_url.trim_end_matches('/'),
+            s.home_token
+        )
+    }
+
     fn overlay_feeds(&self) -> Vec<overlay::Feed> {
         self.running
             .iter()
@@ -1033,6 +1047,46 @@ impl eframe::App for App {
                         dirty |= ui
                             .text_edit_singleline(&mut self.reg.settings.planner_url)
                             .changed();
+                        ui.end_row();
+
+                        ui.label("front door")
+                            .on_hover_text(
+                                "One page listing every character this install \
+                                 streams — bookmark it instead of keeping a link \
+                                 per character.",
+                            );
+                        ui.horizontal(|ui| {
+                            let url = self.home_url();
+                            ui.label(
+                                egui::RichText::new(if url.is_empty() {
+                                    "(register a character first)".to_string()
+                                } else {
+                                    format!(
+                                        "{}…",
+                                        &url[..url.len().min(46)]
+                                    )
+                                })
+                                .monospace()
+                                .small(),
+                            );
+                            if !url.is_empty() {
+                                if ui
+                                    .small_button("copy")
+                                    .on_hover_text(
+                                        "This address IS the key — anyone with it \
+                                         sees every character's links. Treat it \
+                                         like a password.",
+                                    )
+                                    .clicked()
+                                {
+                                    ui.output_mut(|o| o.copied_text = url.clone());
+                                    self.status = "front-door link copied".into();
+                                }
+                                if ui.small_button("open").clicked() {
+                                    let _ = open::that_detached(&url);
+                                }
+                            }
+                        });
                         ui.end_row();
                     ui.label("voice");
                     egui::ComboBox::from_id_salt("voice_engine")
@@ -3037,6 +3091,13 @@ fn main() -> eframe::Result<()> {
     // characters are siblings (the viewer's "another character is live" hint).
     if reg.settings.owner_key.is_empty() {
         reg.settings.owner_key = registry::generate_owner_key();
+        let _ = reg.save();
+    }
+    // The front-door secret: same generator, different job. Whoever holds it
+    // can list every character this install streams, so it is not the
+    // household key — that one is deliberately harmless on its own.
+    if reg.settings.home_token.is_empty() {
+        reg.settings.home_token = registry::generate_owner_key();
         let _ = reg.save();
     }
     let rt = tokio::runtime::Builder::new_multi_thread()
