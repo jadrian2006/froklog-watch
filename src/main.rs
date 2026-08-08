@@ -946,7 +946,12 @@ impl eframe::App for App {
         self.poll_msg_overlay();
         // While the Meter tab is open the overlay force-renders a placeholder
         // — an idle-hidden meter during setup looks exactly like a crash.
-        let want_preview = self.tab == Tab::Meter && self.reg.settings.meter_enabled;
+        // Windows' "Show All Windows" idea: while EITHER overlay tab is
+        // open, force-show BOTH overlays. Arranging them is a relative job —
+        // meter here, messages there — and one at a time made it look like
+        // they could not coexist at all.
+        let arranging = matches!(self.tab, Tab::Meter | Tab::Messages);
+        let want_preview = arranging && self.reg.settings.meter_enabled;
         if want_preview != self.meter_preview {
             self.meter_preview = want_preview;
             if let Some(o) = &self.overlay {
@@ -955,7 +960,7 @@ impl eframe::App for App {
         }
         // Same for the message window: it is hidden whenever nothing has
         // fired, which is most of the time.
-        let want_msg_preview = self.tab == Tab::Messages && self.reg.settings.msg_enabled;
+        let want_msg_preview = arranging && self.reg.settings.msg_enabled;
         if want_msg_preview != self.msg_preview {
             self.msg_preview = want_msg_preview;
             if let Some(o) = &self.msg_overlay {
