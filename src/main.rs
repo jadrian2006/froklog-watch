@@ -170,9 +170,7 @@ impl ksni::Tray for Tray {
                             StandardItem {
                                 label: share_label.into(),
                                 activate: Box::new(move |t: &mut Tray| {
-                                    let _ = t
-                                        .tx
-                                        .send(TrayMsg::Copy(who.clone(), share.clone()));
+                                    let _ = t.tx.send(TrayMsg::Copy(who.clone(), share.clone()));
                                 }),
                                 ..Default::default()
                             }
@@ -227,7 +225,13 @@ struct App {
     pending: Arc<Mutex<BTreeMap<String, Result<(String, String, String), String>>>>,
     busy: Arc<Mutex<Vec<String>>>,
     /// history imports in flight: key -> (finished?, events pushed)
-    imports: BTreeMap<String, (Arc<std::sync::atomic::AtomicBool>, Arc<std::sync::atomic::AtomicU64>)>,
+    imports: BTreeMap<
+        String,
+        (
+            Arc<std::sync::atomic::AtomicBool>,
+            Arc<std::sync::atomic::AtomicU64>,
+        ),
+    >,
     /// publish flips in flight: key -> the new value, or why it failed
     publishing: Arc<Mutex<BTreeMap<String, Result<bool, String>>>>,
     /// stream deletions: key -> None while running, Some(outcome) when done
@@ -332,7 +336,10 @@ impl App {
                 n += 1;
             }
             let s = &self.reg.settings;
-            if let (Some(view), Some(share)) = (c.view_url(&s.server_url), c.share_url(&s.server_url, &s.game)) {
+            if let (Some(view), Some(share)) = (
+                c.view_url(&s.server_url),
+                c.share_url(&s.server_url, &s.game),
+            ) {
                 links.push(TrayChar {
                     label: c.key(),
                     view_url: view,
@@ -460,20 +467,16 @@ impl App {
     /// Hand one fired trigger's announcement to the message window.
     fn announce(&mut self, msg: messages::Msg) {
         if let Some(o) = &self.msg_overlay {
-            let _ = o
-                .tx
-                .send(overlay::OverlayMsg::Announce(Box::new(msg)));
+            let _ = o.tx.send(overlay::OverlayMsg::Announce(Box::new(msg)));
         }
     }
 
     fn push_msg_settings(&self) {
         if let Some(o) = &self.msg_overlay {
-            let _ = o
-                .tx
-                .send(overlay::OverlayMsg::SetMessageStyle(self.msg_style()));
-            let _ = o
-                .tx
-                .send(overlay::OverlayMsg::SetLocked(self.reg.settings.msg_locked));
+            let _ =
+                o.tx.send(overlay::OverlayMsg::SetMessageStyle(self.msg_style()));
+            let _ =
+                o.tx.send(overlay::OverlayMsg::SetLocked(self.reg.settings.msg_locked));
         }
     }
 
@@ -678,7 +681,9 @@ impl App {
         }
         let settings = self.reg.settings.clone();
         for (key, ch) in self.reg.characters.clone() {
-            let should_run = ch.enabled && ch.registered();
+            // Enabled is enough: an unregistered character runs local-only
+            // (engine::start skips the pusher when there is no stream).
+            let should_run = ch.enabled;
             let is_running = self.running.contains_key(&key);
             if should_run && !is_running {
                 let sink = self
@@ -925,12 +930,16 @@ impl eframe::App for App {
             }
         }
         // Feed the tray's state color: orange when any watched pipeline's
-        // pusher has lost the server.
+        // pusher has lost the server — or when the server is REJECTING
+        // batches, which is worse than disconnected: data is being lost
+        // while everything otherwise looks healthy.
         {
-            let ok = self
-                .running
-                .values()
-                .all(|h| h.connected.load(Ordering::Relaxed));
+            let rejects = froklog::pusher::BATCH_REJECTS.load(Ordering::Relaxed);
+            let ok = rejects == 0
+                && self
+                    .running
+                    .values()
+                    .all(|h| h.connected.load(Ordering::Relaxed));
             *self.tray_connected_ok.lock().unwrap() = ok;
         }
         self.poll_overlay(ctx);
@@ -2842,6 +2851,23 @@ impl eframe::App for App {
                     }
                 }
                 Tab::Characters => {
+                {
+                    let rejects = froklog::pusher::BATCH_REJECTS.load(Ordering::Relaxed);
+                    if rejects > 0 {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "\u{26a0} The server has REJECTED {rejects} event \
+                                 batch{} — those events are lost. This almost always \
+                                 means the server is running an OLDER version than \
+                                 this client: update the server, then restart this \
+                                 client.",
+                                if rejects == 1 { "" } else { "es" }
+                            ))
+                            .color(egui::Color32::from_rgb(240, 120, 100)),
+                        );
+                        ui.add_space(6.0);
+                    }
+                }
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Characters").strong());
@@ -2873,24 +2899,36 @@ impl eframe::App for App {
                         };
                         let registered = ch.registered();
                         ui.horizontal(|ui| {
-                            // Only a registered character can be watched. Rather than a
-                            // dead tick box with no explanation, say what is missing.
-                            if registered {
-                                let mut on = ch.enabled;
-                                if ui
-                                    .checkbox(&mut on, "")
-                                    .on_hover_text("Stream this character's log to froklog")
-                                    .changed()
-                                {
-                                    ch.enabled = on;
-                                    dirty = true;
-                                }
-                            } else {
-                                ui.label(egui::RichText::new("○").weak())
-                                    .on_hover_text("Register this character first");
+                            // Watching never requires the server: unregistered
+                            // characters run the same pipeline locally — meter,
+                            // triggers, fight history — with nothing streamed.
+                            let mut on = ch.enabled;
+                            if ui
+                                .checkbox(&mut on, "")
+                                .on_hover_text(if registered {
+                                    "Stream this character's log to froklog"
+                                } else {
+                                    "Watch locally — meter and triggers work, \
+                                     nothing streams. Register to get a web view."
+                                })
+                                .changed()
+                            {
+                                ch.enabled = on;
+                                dirty = true;
                             }
                             ui.label(egui::RichText::new(&ch.player).strong());
                             ui.label(egui::RichText::new(format!("· {}", ch.server)).weak());
+                            if !registered && ch.enabled {
+                                ui.label(
+                                    egui::RichText::new("local")
+                                        .small()
+                                        .color(egui::Color32::from_rgb(120, 190, 250)),
+                                )
+                                .on_hover_text(
+                                    "Parsed on this machine only — no stream, no web \
+                                     page. Register to publish it.",
+                                );
+                            }
 
                             if !registered {
                                 if busy.contains(&key) {
@@ -3161,7 +3199,11 @@ fn main() -> eframe::Result<()> {
         alerts: alerts::Alerts::load(reg_triggers_enabled),
         restart_watching: false,
         // an unconfigured install has nothing to show on the other two tabs
-        tab: if reg_configured { Tab::Characters } else { Tab::Server },
+        tab: if reg_configured {
+            Tab::Characters
+        } else {
+            Tab::Server
+        },
         phrase: "Zarri says, 'Hail, Icestorm'".into(),
         pron: alerts::pronunciations(),
         builder_line: String::new(),
@@ -3217,7 +3259,9 @@ fn main() -> eframe::Result<()> {
     // session that offers XWayland, ask winit for the X11 backend. Without
     // DISPLAY we stay on Wayland and the window simply stays open.
     let force_x11 = std::env::var_os("WAYLAND_DISPLAY").is_some()
-        && std::env::var("DISPLAY").map(|d| !d.is_empty()).unwrap_or(false);
+        && std::env::var("DISPLAY")
+            .map(|d| !d.is_empty())
+            .unwrap_or(false);
 
     eframe::run_native(
         "froklog watch",

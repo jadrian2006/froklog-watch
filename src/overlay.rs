@@ -129,14 +129,7 @@ pub struct OverlaySpawn {
 fn pick_feed(feeds: &[Feed]) -> Option<Feed> {
     feeds
         .iter()
-        .max_by_key(|f| {
-            f.combat
-                .load()
-                .mob_list
-                .iter()
-                .map(|m| m.last_seen)
-                .max()
-        })
+        .max_by_key(|f| f.combat.load().mob_list.iter().map(|m| m.last_seen).max())
         .cloned()
 }
 
@@ -193,10 +186,9 @@ impl Gpu {
         }))
         .ok_or("no wgpu adapter")?;
         mdbg!("gpu: adapter {:?}", adapter.get_info().name);
-        let (device, queue) = pollster::block_on(
-            adapter.request_device(&wgpu::DeviceDescriptor::default(), None),
-        )
-        .map_err(|e| format!("wgpu device: {e}"))?;
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
+                .map_err(|e| format!("wgpu device: {e}"))?;
         mdbg!("gpu: device ready");
 
         let caps = surface.get_capabilities(&adapter);
@@ -446,8 +438,10 @@ impl App {
         self.showing = showing;
         // 60 Hz only while a message is actually flying — the rest of the
         // time this window is a static list and 5 Hz is plenty.
-        self.tick_ms
-            .store(if self.msgs.animating() { 16 } else { 200 }, Ordering::Relaxed);
+        self.tick_ms.store(
+            if self.msgs.animating() { 16 } else { 200 },
+            Ordering::Relaxed,
+        );
         self.finish_frame(ev, full);
     }
 
@@ -499,8 +493,7 @@ impl App {
                         .inner_margin(8.0);
                     let r = panel.show(ui, |ui| {
                         ui.set_width(ui.available_width() - 16.0);
-                        let (acts, content) =
-                            meter_ui::draw(ui, view, &cs, style, locked, preview);
+                        let (acts, content) = meter_ui::draw(ui, view, &cs, style, locked, preview);
                         actions.extend(acts);
                         has_content = content;
                     });
@@ -649,7 +642,8 @@ impl App {
         for id in &textures.free {
             gpu.renderer.free_texture(id);
         }
-        gpu.queue.submit(user_cmds.into_iter().chain([encoder.finish()]));
+        gpu.queue
+            .submit(user_cmds.into_iter().chain([encoder.finish()]));
         frame.present();
     }
 }
@@ -670,7 +664,9 @@ pub fn spawn(init: OverlaySpawn) -> OverlayHandle {
         std::thread::Builder::new()
             .name("meter-tick".into())
             .spawn(move || loop {
-                std::thread::sleep(Duration::from_millis(tick_ms.load(Ordering::Relaxed).max(8)));
+                std::thread::sleep(Duration::from_millis(
+                    tick_ms.load(Ordering::Relaxed).max(8),
+                ));
                 if tx.send(OverlayMsg::Tick).is_err() {
                     break;
                 }

@@ -48,7 +48,12 @@ impl Character {
     pub fn view_url(&self, server_url: &str) -> Option<String> {
         let id = self.stream_id.as_ref()?;
         let tok = self.view_token.as_ref()?;
-        Some(format!("{}/stream/{}?vtok={}", server_url.trim_end_matches('/'), id, tok))
+        Some(format!(
+            "{}/stream/{}?vtok={}",
+            server_url.trim_end_matches('/'),
+            id,
+            tok
+        ))
     }
 
     /// The public page: no token, readable name, and revocable by turning

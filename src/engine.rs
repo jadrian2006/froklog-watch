@@ -79,7 +79,11 @@ pub async fn set_public(settings: &Settings, ch: &Character, public: bool) -> Re
         .stream_token
         .as_ref()
         .ok_or_else(|| anyhow!("character has no stream token"))?;
-    let url = format!("{}/stream/{}", settings.server_url.trim_end_matches('/'), id);
+    let url = format!(
+        "{}/stream/{}",
+        settings.server_url.trim_end_matches('/'),
+        id
+    );
     let resp = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
@@ -105,7 +109,11 @@ pub async fn backfill_owner_key(settings: &Settings, ch: &Character) -> Result<(
     let (Some(id), Some(token)) = (&ch.stream_id, &ch.stream_token) else {
         return Ok(());
     };
-    let url = format!("{}/stream/{}", settings.server_url.trim_end_matches('/'), id);
+    let url = format!(
+        "{}/stream/{}",
+        settings.server_url.trim_end_matches('/'),
+        id
+    );
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
@@ -158,6 +166,9 @@ pub async fn delete_stream(settings: &Settings, ch: &Character) -> Result<()> {
 
 /// Live counters for one running character, so the UI can show it working.
 pub struct Handle {
+    /// No stream: parsing, meter, triggers and fight history only. Healthy
+    /// by definition — there is no server to be disconnected from.
+    pub local_only: bool,
     pub events_sent: Arc<AtomicU64>,
     pub connected: Arc<AtomicBool>,
     pub last_error: Arc<RwLock<Option<String>>>,
@@ -304,13 +315,14 @@ pub fn start(
     ch: &Character,
     lines_out: Option<crossbeam_channel::Sender<String>>,
 ) -> Result<Handle> {
-    let push_url = ch
+    // Registration buys the STREAM — the meter, triggers and fight history
+    // are all fed by the local parser and owe the server nothing. An
+    // unregistered character runs the same pipeline minus the pusher, so
+    // the client stays fully usable when the server is down or absent.
+    let push = ch
         .ingest_url(&settings.server_url)
-        .ok_or_else(|| anyhow!("character is not registered"))?;
-    let token = ch
-        .stream_token
-        .clone()
-        .ok_or_else(|| anyhow!("character has no stream token"))?;
+        .zip(ch.stream_token.clone());
+    let local_only = push.is_none();
     let path = ch.log_path.clone();
     let player = ch.player.clone();
 
@@ -388,29 +400,41 @@ pub fn start(
             .context("spawning parser thread")?;
     }
 
-    // pusher: events -> froklog
-    {
-        let events_sent = Arc::clone(&events_sent);
-        let connected = Arc::clone(&connected);
-        let last_error = Arc::clone(&last_error);
-        let restart = Arc::clone(&restart);
-        let quit = Arc::clone(&quit);
-        rt.spawn(async move {
-            froklog::pusher::push_to_server(
-                push_url,
-                token,
-                event_rx,
-                events_sent,
-                connected,
-                last_error,
-                restart,
-                quit,
-            )
-            .await;
-        });
+    // pusher: events -> froklog. Local-only characters skip it; the event
+    // channel must still drain or the parser's sends back up forever.
+    match push {
+        Some((push_url, token)) => {
+            let events_sent = Arc::clone(&events_sent);
+            let connected = Arc::clone(&connected);
+            let last_error = Arc::clone(&last_error);
+            let restart = Arc::clone(&restart);
+            let quit = Arc::clone(&quit);
+            rt.spawn(async move {
+                froklog::pusher::push_to_server(
+                    push_url,
+                    token,
+                    event_rx,
+                    events_sent,
+                    connected,
+                    last_error,
+                    restart,
+                    quit,
+                )
+                .await;
+            });
+        }
+        None => {
+            // "Connected" would light the tray green over nothing, and false
+            // reads as an outage. Local-only is its own healthy state — the
+            // Handle carries the flag and the tray/UI treat it as OK.
+            connected.store(true, Ordering::Relaxed);
+            let mut event_rx = event_rx;
+            rt.spawn(async move { while event_rx.recv().await.is_some() {} });
+        }
     }
 
     Ok(Handle {
+        local_only,
         events_sent,
         connected,
         last_error,

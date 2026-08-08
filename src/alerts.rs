@@ -197,14 +197,7 @@ impl Alerts {
 
     /// Append a new trigger and write it to the same file the Windows client
     /// reads, so anything built here is portable back to it.
-    pub fn add_trigger(
-        &mut self,
-        name: &str,
-        pattern: &str,
-        sound: &str,
-        say: &str,
-        show: &str,
-    ) {
+    pub fn add_trigger(&mut self, name: &str, pattern: &str, sound: &str, say: &str, show: &str) {
         let mut actions = Vec::new();
         if !sound.is_empty() {
             actions.push(Action::PlaySound {
@@ -234,7 +227,6 @@ impl Alerts {
         self.cfg.save();
         self.engine.reload(&self.cfg);
     }
-
 }
 
 /// The overlay action the builder writes. Icon and colours are left at their
@@ -278,9 +270,7 @@ impl Alerts {
         let mut show = String::new();
         for a in &t.actions {
             match a {
-                Action::PlaySound { sound: Some(s), .. } if sound.is_empty() => {
-                    sound = s.clone()
-                }
+                Action::PlaySound { sound: Some(s), .. } if sound.is_empty() => sound = s.clone(),
                 Action::VoiceAlert { tts_text, .. } if say.is_empty() => say = tts_text.clone(),
                 Action::Overlay { message, .. } if show.is_empty() => show = message.clone(),
                 _ => return None,
@@ -588,7 +578,10 @@ fn respell(text: &str, table: &[(String, String)]) -> String {
                     .next_back()
                     .is_some_and(|c| c.is_alphanumeric());
             let after_ok = end == lower.len()
-                || !lower[end..].chars().next().is_some_and(|c| c.is_alphanumeric());
+                || !lower[end..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_alphanumeric());
             result.push_str(&out[at..start]);
             if before_ok && after_ok {
                 result.push_str(to);
@@ -845,7 +838,16 @@ pub fn speak_forced(text: &str, priority: &VoicePriority, voice: &Voice) -> bool
             // maps onto the attenuation half so 100 stays the voice default.
             let vol = (VOLUME.load(Ordering::Relaxed).min(100) as i32 - 100).to_string();
             Command::new("spd-say")
-                .args(["--priority", prio, "-i", &vol, "--application-name", "froklog-watch", "--", text])
+                .args([
+                    "--priority",
+                    prio,
+                    "-i",
+                    &vol,
+                    "--application-name",
+                    "froklog-watch",
+                    "--",
+                    text,
+                ])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
@@ -962,7 +964,9 @@ mod tests {
         let kick = "You kick a rat for 3 points of damage. (Critical)";
         assert_eq!(&re.captures(kick).unwrap()[1], "kick");
         // but a non-crit line does not
-        assert!(re.captures("You kick a rat for 3 points of damage.").is_none());
+        assert!(re
+            .captures("You kick a rat for 3 points of damage.")
+            .is_none());
     }
 
     #[test]
@@ -1005,7 +1009,8 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         std::env::set_var("HOME", &tmp);
 
-        let line = builder::strip_timestamp("[Sun Jul 26 19:12:18 2026] Zarri has merged an item to +4");
+        let line =
+            builder::strip_timestamp("[Sun Jul 26 19:12:18 2026] Zarri has merged an item to +4");
         let tokens = builder::tokenize(line);
         let chosen: std::collections::BTreeSet<usize> = tokens
             .iter()
@@ -1092,7 +1097,11 @@ mod tests {
                 assert_eq!(icon, "warn", "icon survived");
                 assert_eq!(color, "#FF4400", "accent survived");
                 assert_eq!(message_color, "#FFDD44", "text colour survived");
-                assert_eq!(*treatment, froklog::triggers::engine::Treatment::Vibrate, "treatment survived");
+                assert_eq!(
+                    *treatment,
+                    froklog::triggers::engine::Treatment::Vibrate,
+                    "treatment survived"
+                );
                 assert_eq!(*priority, VoicePriority::Emergency, "priority survived");
             }
             other => panic!("expected an overlay action, got {other:?}"),
@@ -1185,7 +1194,8 @@ mod tests {
     /// spoken template referring to them, and hear the words come back.
     #[test]
     fn captures_come_back_as_numbered_placeholders() {
-        let line = builder::strip_timestamp("[Sun Jul 26 19:12:18 2026] Zarri has merged an item to +4");
+        let line =
+            builder::strip_timestamp("[Sun Jul 26 19:12:18 2026] Zarri has merged an item to +4");
         let tokens = builder::tokenize(line);
         let chosen: std::collections::BTreeSet<usize> = tokens
             .iter()

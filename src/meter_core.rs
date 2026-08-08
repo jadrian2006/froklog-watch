@@ -66,6 +66,7 @@ impl MeterTab {
     }
 }
 
+#[derive(Clone)]
 pub struct RowData {
     pub name: String,
     pub color: (u8, u8, u8),
@@ -84,11 +85,7 @@ pub struct RowData {
 /// sorted or truncated — used both to build display rows and to sum a
 /// cumulative footer total across *every* contributor, not just the ones
 /// that fit on screen.
-fn tab_entries(
-    cs: &CombatState,
-    mob_id: u64,
-    tab: MeterTab,
-) -> Vec<(&String, &EntityCombatStats)> {
+fn tab_entries(cs: &CombatState, mob_id: u64, tab: MeterTab) -> Vec<(&String, &EntityCombatStats)> {
     let Some(bucket) = tab.bucket(cs, mob_id) else {
         return Vec::new();
     };
@@ -163,6 +160,79 @@ pub fn resolve_view_mob_id(cs: &CombatState, pinned: Option<u64>) -> Option<u64>
 }
 
 pub const MAX_PICKER_ENTRIES: usize = 6;
+
+/// One finished fight, frozen for the meter's local history.
+///
+/// All four tabs are captured at the moment the mob dies or times out, so
+/// flipping Dmg/Heal/Tank while reviewing shows what each looked like then.
+/// This lives in the meter (RAM, ring of `FIGHT_MEMORY`) and owes the server
+/// nothing — reviewing your last pulls works with no stream at all.
+#[derive(Clone)]
+pub struct FightEntry {
+    /// (mob id, first_log_ts) — ids restart after a reset, the pair does not
+    /// collide across one.
+    pub key: (u64, u32),
+    pub mob_name: String,
+    pub ended: std::time::Instant,
+    pub duration_secs: u64,
+    /// Indexed by `MeterTab::ALL` order.
+    pub tabs: [MeterSnapshot; 4],
+}
+
+/// How many finished fights the meter remembers.
+pub const FIGHT_MEMORY: usize = 5;
+
+/// Capture any confirmed mob that has just finished — died, or gone 15 s
+/// without a combat line (the picker's own timeout) — into `mem`, newest
+/// first, keeping `FIGHT_MEMORY`. `seen` prevents recapture while the mob
+/// lingers on the list. Fights with no damage at all (a /who sighting, a
+/// parked mez) are not history worth keeping.
+pub fn capture_finished_fights(
+    cs: &CombatState,
+    mem: &mut Vec<FightEntry>,
+    seen: &mut std::collections::HashSet<(u64, u32)>,
+) {
+    for m in cs.mob_list.iter() {
+        if !cs.confirmed_mobs.contains(&m.name) || m.parked {
+            continue;
+        }
+        let key = (m.id, m.first_log_ts);
+        if seen.contains(&key) {
+            continue;
+        }
+        let done = cs.dead_mobs.contains(&m.name) || m.last_seen.elapsed().as_secs_f64() >= 15.0;
+        if !done {
+            continue;
+        }
+        let tabs = [
+            compute_snapshot(cs, m.id, MeterTab::ALL[0], usize::MAX),
+            compute_snapshot(cs, m.id, MeterTab::ALL[1], usize::MAX),
+            compute_snapshot(cs, m.id, MeterTab::ALL[2], usize::MAX),
+            compute_snapshot(cs, m.id, MeterTab::ALL[3], usize::MAX),
+        ];
+        if tabs[0].footer_total == 0 {
+            continue;
+        }
+        seen.insert(key);
+        mem.insert(
+            0,
+            FightEntry {
+                key,
+                mob_name: m.name.clone(),
+                ended: std::time::Instant::now(),
+                duration_secs: tabs[0].elapsed_secs,
+                tabs,
+            },
+        );
+        mem.truncate(FIGHT_MEMORY);
+    }
+    // A reset (or prune) empties the mob list; drop stale keys so ids reused
+    // later, paired with fresh first_log_ts values, stay collision-free and
+    // the set cannot grow without bound.
+    if cs.mob_list.is_empty() {
+        seen.clear();
+    }
+}
 
 pub struct MobPickerEntry {
     /// `None` = the "Auto (most recent)" entry, clearing any pin.
@@ -253,6 +323,7 @@ fn build_rows(
 /// one mob/tab combination — computed once per use so the render pass and
 /// the copy-icon click handler can never disagree about what's "currently
 /// on screen."
+#[derive(Clone)]
 pub struct MeterSnapshot {
     pub mob_name: String,
     pub rows: Vec<RowData>,
@@ -494,5 +565,73 @@ mod live_probe {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fight_memory_tests {
+    use super::*;
+    use froklog::state::CombatState;
+    use std::sync::{atomic::AtomicBool, Arc};
+
+    fn state_from(lines: &[&str]) -> Arc<CombatState> {
+        let (ltx, lrx) = crossbeam_channel::unbounded();
+        for l in lines {
+            ltx.send(l.to_string()).unwrap();
+        }
+        drop(ltx);
+        let shared = Arc::new(arc_swap::ArcSwap::from_pointee(CombatState::default()));
+        let reset = Arc::new(AtomicBool::new(false));
+        let (btx, _brx) = tokio::sync::broadcast::channel(16);
+        let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
+        std::thread::spawn(move || while erx.blocking_recv().is_some() {});
+        froklog::parser::run(lrx, Arc::clone(&shared), reset, btx, etx, "Izzin".into());
+        shared.load_full()
+    }
+
+    /// A killed mob is remembered exactly once, with its damage frozen — the
+    /// meter's own history, no server involved.
+    #[test]
+    fn a_dead_mob_is_captured_once_with_its_numbers() {
+        let cs = state_from(&[
+            "[Tue Feb 27 22:00:07 2026] You slash a rat for 25 points of damage.",
+            "[Tue Feb 27 22:00:09 2026] You slash a rat for 30 points of damage.",
+            "[Tue Feb 27 22:00:10 2026] You have slain a rat!",
+        ]);
+        let mut mem = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        capture_finished_fights(&cs, &mut mem, &mut seen);
+        assert_eq!(mem.len(), 1, "one finished fight");
+        assert_eq!(mem[0].mob_name, "a rat");
+        assert_eq!(mem[0].tabs[0].footer_total, 55, "damage frozen at death");
+
+        capture_finished_fights(&cs, &mut mem, &mut seen);
+        assert_eq!(mem.len(), 1, "same fight is never captured twice");
+    }
+
+    /// Only the last FIGHT_MEMORY fights are kept, newest first.
+    #[test]
+    fn the_ring_keeps_the_newest_five() {
+        let mut lines = Vec::new();
+        for i in 0..7 {
+            lines.push(format!(
+                "[Tue Feb 27 22:0{i}:07 2026] You slash a gnoll for {} points of damage.",
+                10 + i
+            ));
+            lines.push(format!(
+                "[Tue Feb 27 22:0{i}:09 2026] You have slain a gnoll!"
+            ));
+        }
+        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        let cs = state_from(&refs);
+        let mut mem = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        capture_finished_fights(&cs, &mut mem, &mut seen);
+        assert!(
+            mem.len() <= FIGHT_MEMORY,
+            "capped at {FIGHT_MEMORY}: {}",
+            mem.len()
+        );
+        assert!(!mem.is_empty());
     }
 }

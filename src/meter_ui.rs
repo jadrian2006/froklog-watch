@@ -9,8 +9,8 @@ use egui::{Color32, RichText};
 use froklog::state::CombatState;
 
 use crate::meter_core::{
-    build_mob_picker_entries, build_summary_line, compute_snapshot, fmt_duration, fmt_k,
-    resolve_view_mob_id, MeterTab,
+    build_mob_picker_entries, build_summary_line, capture_finished_fights, compute_snapshot,
+    fmt_duration, fmt_k, resolve_view_mob_id, FightEntry, MeterTab,
 };
 
 /// UI state that survives across frames but is not persisted config.
@@ -18,6 +18,13 @@ pub struct MeterView {
     pub tab: MeterTab,
     pub pinned: Option<u64>,
     pub picker_open: bool,
+    /// The meter's local fight history — last few finished pulls, frozen.
+    /// Lives here so it works identically on the layer-shell overlay and the
+    /// X11 fallback, and entirely without a server.
+    pub fights: Vec<FightEntry>,
+    fights_seen: std::collections::HashSet<(u64, u32)>,
+    /// Reviewing a remembered fight instead of the live view.
+    pub viewing_fight: Option<usize>,
     /// Last frame's title-bar rect. The drag handle has to be registered
     /// BEFORE the widgets it covers (see `draw`), which means it can only
     /// use a rect measured on the previous frame.
@@ -30,6 +37,9 @@ impl Default for MeterView {
             tab: MeterTab::Dps,
             pinned: None,
             picker_open: false,
+            fights: Vec::new(),
+            fights_seen: std::collections::HashSet::new(),
+            viewing_fight: None,
             title_rect: egui::Rect::NOTHING,
         }
     }
@@ -70,7 +80,11 @@ fn paint_share_bar(
 ) {
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     let p = ui.painter();
-    p.rect_filled(rect, 2.0, Color32::from_rgba_unmultiplied(255, 255, 255, 12));
+    p.rect_filled(
+        rect,
+        2.0,
+        Color32::from_rgba_unmultiplied(255, 255, 255, 12),
+    );
     let w = rect.width() * pct.clamp(0.0, 1.0);
     if w >= 1.0 {
         let c = |i: usize| {
@@ -132,11 +146,14 @@ pub fn draw(
 ) -> (Vec<MeterAction>, bool) {
     let mut actions = Vec::new();
 
+    capture_finished_fights(cs, &mut view.fights, &mut view.fights_seen);
     let resolved = resolve_view_mob_id(cs, view.pinned);
-    if resolved.is_none() && !preview {
+    if resolved.is_none() && view.viewing_fight.is_some() {
+        // Nothing live, reviewing a remembered fight: keep the meter up.
+        // A zero id is fine — the frozen snapshot bypasses live lookups.
+    } else if resolved.is_none() && !preview {
         return (actions, false);
-    }
-    if resolved.is_none() {
+    } else if resolved.is_none() {
         // Preview placeholder: title bar (draggable) + a hint, no data rows.
         let fs = style.font_size;
         // Registered before the tabs, for the same reason as the live bar.
@@ -175,13 +192,31 @@ pub fn draw(
         );
         return (actions, true);
     }
-    let mob_id = resolved.unwrap();
+    let mob_id = resolved.unwrap_or(0);
     // A pin that fell off the mob list silently reverts to auto, like Windows.
     if view.pinned.is_some() && !cs.mob_list.iter().any(|m| Some(m.id) == view.pinned) {
         view.pinned = None;
     }
 
-    let snap = compute_snapshot(cs, mob_id, view.tab, style.max_rows);
+    // Reviewing history: the frozen snapshot stands in for the live one, on
+    // whichever tab is selected. Everything below renders it unchanged.
+    if let Some(i) = view.viewing_fight {
+        if i >= view.fights.len() {
+            view.viewing_fight = None;
+        }
+    }
+    let tab_idx = MeterTab::ALL
+        .iter()
+        .position(|t| *t == view.tab)
+        .unwrap_or(0);
+    let snap = match view.viewing_fight {
+        Some(i) => {
+            let mut s = view.fights[i].tabs[tab_idx].clone();
+            s.rows.truncate(style.max_rows);
+            s
+        }
+        None => compute_snapshot(cs, mob_id, view.tab, style.max_rows),
+    };
     let fs = style.font_size;
     let text_col = Color32::from_rgb(228, 228, 234);
     let dim_col = Color32::from_rgb(150, 150, 160);
@@ -225,14 +260,20 @@ pub fn draw(
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .add_enabled(!locked, egui::Button::new(RichText::new("⚙").size(fs)).small())
+                    .add_enabled(
+                        !locked,
+                        egui::Button::new(RichText::new("⚙").size(fs)).small(),
+                    )
                     .on_hover_text("Meter settings")
                     .clicked()
                 {
                     actions.push(MeterAction::OpenSettings);
                 }
                 if ui
-                    .add_enabled(!locked, egui::Button::new(RichText::new("🗑").size(fs)).small())
+                    .add_enabled(
+                        !locked,
+                        egui::Button::new(RichText::new("🗑").size(fs)).small(),
+                    )
                     .on_hover_text("Clear combat totals")
                     .clicked()
                 {
@@ -240,7 +281,10 @@ pub fn draw(
                     actions.push(MeterAction::Reset);
                 }
                 if ui
-                    .add_enabled(!locked, egui::Button::new(RichText::new("📋").size(fs)).small())
+                    .add_enabled(
+                        !locked,
+                        egui::Button::new(RichText::new("📋").size(fs)).small(),
+                    )
                     .on_hover_text("Copy summary for chat")
                     .clicked()
                 {
@@ -370,7 +414,8 @@ pub fn draw(
         for entry in build_mob_picker_entries(cs) {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("●").size(fs - 3.0).color(dim(entry.dot)));
-                let selected = entry.id == view.pinned && entry.id.is_some();
+                let selected =
+                    entry.id == view.pinned && entry.id.is_some() && view.viewing_fight.is_none();
                 if ui
                     .selectable_label(
                         selected,
@@ -379,9 +424,57 @@ pub fn draw(
                     .clicked()
                 {
                     view.pinned = entry.id;
+                    view.viewing_fight = None;
                     view.picker_open = false;
                 }
             });
+        }
+        // ── Recent fights: the meter's own memory, server not required ──
+        if !view.fights.is_empty() {
+            ui.label(
+                RichText::new("recent fights")
+                    .size(fs - 3.0)
+                    .color(Color32::from_rgb(120, 120, 130)),
+            );
+            for i in 0..view.fights.len() {
+                let (label, selected) = {
+                    let f = &view.fights[i];
+                    let ago = f.ended.elapsed().as_secs();
+                    let ago = if ago >= 3600 {
+                        format!("{}h ago", ago / 3600)
+                    } else if ago >= 60 {
+                        format!("{}m ago", ago / 60)
+                    } else {
+                        format!("{ago}s ago")
+                    };
+                    (
+                        format!(
+                            "{} · {} · {}",
+                            f.mob_name,
+                            fmt_duration(f.duration_secs),
+                            ago
+                        ),
+                        view.viewing_fight == Some(i),
+                    )
+                };
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("↺")
+                            .size(fs - 3.0)
+                            .color(dim((110, 110, 118))),
+                    );
+                    if ui
+                        .selectable_label(
+                            selected,
+                            RichText::new(label).size(fs - 1.0).color(text_col),
+                        )
+                        .clicked()
+                    {
+                        view.viewing_fight = if selected { None } else { Some(i) };
+                        view.picker_open = false;
+                    }
+                });
+            }
         }
     }
 
@@ -395,7 +488,12 @@ mod tests {
     /// Run one egui pass, laying out a click widget and a drag handle over
     /// the same rect in the given order. Returns the click widget's rect and
     /// whether it registered a click.
-    fn pass(ctx: &egui::Context, events: Vec<Event>, handle: Rect, drag_first: bool) -> (Rect, bool) {
+    fn pass(
+        ctx: &egui::Context,
+        events: Vec<Event>,
+        handle: Rect,
+        drag_first: bool,
+    ) -> (Rect, bool) {
         let mut clicked = false;
         let mut rect = Rect::NOTHING;
         let input = egui::RawInput {
@@ -441,7 +539,10 @@ mod tests {
             let events = vec![Event::PointerMoved(pos), click(true), click(false)];
             let (_, clicked) = pass(&ctx, events, rect, drag_first);
             if drag_first {
-                assert!(clicked, "handle registered FIRST must leave the tab clickable");
+                assert!(
+                    clicked,
+                    "handle registered FIRST must leave the tab clickable"
+                );
             } else {
                 assert!(
                     !clicked,

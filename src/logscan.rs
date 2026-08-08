@@ -45,7 +45,8 @@ fn is_chat(body: &str) -> bool {
 fn read_tail(log: &Path) -> Option<String> {
     let mut f = std::fs::File::open(log).ok()?;
     let len = f.metadata().ok()?.len();
-    f.seek(SeekFrom::Start(len.saturating_sub(SCAN_BYTES))).ok()?;
+    f.seek(SeekFrom::Start(len.saturating_sub(SCAN_BYTES)))
+        .ok()?;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf).ok()?;
     Some(String::from_utf8_lossy(&buf).into_owned())
@@ -126,17 +127,26 @@ pub fn unique_templates(log: &Path, max: usize) -> Vec<(u32, String)> {
 /// — the "what does a crit even look like" cheat sheet. Click-to-seed into
 /// the trigger builder. Examples use this server's observed formats.
 pub const KNOWN_SHAPES: &[(&str, &str)] = &[
-    ("melee hit", "You slash an orc pawn for 36 points of damage."),
+    (
+        "melee hit",
+        "You slash an orc pawn for 36 points of damage.",
+    ),
     (
         "critical hit (suffix!)",
         "You cleave Emperor Crush for 37 points of damage. (Critical)",
     ),
-    ("mob hits you", "An orc pawn hits YOU for 12 points of damage."),
+    (
+        "mob hits you",
+        "An orc pawn hits YOU for 12 points of damage.",
+    ),
     (
         "you avoid",
         "Emperor Crush tries to slash YOU, but YOU dodge!",
     ),
-    ("mob avoids", "You try to slash an orc pawn, but an orc pawn dodges!"),
+    (
+        "mob avoids",
+        "You try to slash an orc pawn, but an orc pawn dodges!",
+    ),
     (
         "spell damage",
         "Ruin hit an orc pawn for 44 points of fire damage by Bolt of Flame.",
@@ -145,7 +155,10 @@ pub const KNOWN_SHAPES: &[(&str, &str)] = &[
         "damage over time",
         "An orc pawn has been damaged by Zary's Flame Lick for 8 points of damage.",
     ),
-    ("heal", "Izzin healed Zary for 120 hit points by Light Healing."),
+    (
+        "heal",
+        "Izzin healed Zary for 120 hit points by Light Healing.",
+    ),
     ("you kill", "You have slain Emperor Crush!"),
     ("someone kills", "Ruin has slain an orc pawn!"),
     ("you die", "You have been slain by an orc pawn!"),
