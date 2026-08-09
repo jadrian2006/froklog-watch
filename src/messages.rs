@@ -73,7 +73,9 @@ enum Category {
 impl Category {
     fn from_icon(icon: &str) -> Self {
         match icon {
-            "damage" | "warn" | "skull.png" | "sword.png" | "alert.png" => Self::Combat,
+            "damage" | "warn" | "crit" | "finishing" | "skull.png" | "sword.png" | "alert.png" => {
+                Self::Combat
+            }
             "heal" | "spell" | "heart.png" | "star.png" | "lightning.png" => Self::Loot,
             _ => Self::System,
         }
@@ -95,6 +97,17 @@ impl Category {
             Self::Loot => "\u{2726}",
             Self::System => "\u{25cf}",
         }
+    }
+}
+
+/// Specific icon keys get their own glyph; anything else falls back to the
+/// category marker. Keys are what a triggers.toml `icon =` names, so they
+/// are part of the trigger-file vocabulary, not just internal.
+fn icon_glyph(icon: &str) -> Option<&'static str> {
+    match icon {
+        "crit" => Some("\u{26a1}"),      // ⚡ a critical landing
+        "finishing" => Some("\u{2620}"), // ☠ the killing stroke
+        _ => None,
     }
 }
 
@@ -338,7 +351,7 @@ impl Messages {
             for e in self.history.iter() {
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(e.msg.category().glyph())
+                        RichText::new(icon_glyph(&e.msg.icon).unwrap_or(e.msg.category().glyph()))
                             .size(size)
                             .color(e.msg.accent()),
                     );
@@ -401,7 +414,7 @@ impl Messages {
         ui.horizontal(|ui| {
             ui.add_space(jitter.max(0.0));
             ui.label(
-                RichText::new(a.msg.category().glyph())
+                RichText::new(icon_glyph(&a.msg.icon).unwrap_or(a.msg.category().glyph()))
                     .size(size * 0.8)
                     .color(a8(a.msg.accent(), 1.0)),
             );
