@@ -500,7 +500,7 @@ mod tests {
             events,
             ..Default::default()
         };
-        ctx.run(input, |ctx| {
+        let _ = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 if drag_first {
                     let _ = ui.interact(handle, ui.id().with("handle"), Sense::drag());

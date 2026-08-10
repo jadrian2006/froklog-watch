@@ -29,7 +29,6 @@ use crate::meter_ui::{self, MeterAction, MeterStyle, MeterView};
 /// One watched character's live combat feed, cloned out of `engine::Handle`.
 #[derive(Clone)]
 pub struct Feed {
-    pub player: String,
     pub combat: Arc<ArcSwap<CombatState>>,
     pub reset: Arc<AtomicBool>,
 }
@@ -456,7 +455,6 @@ impl App {
             Some(f) => f,
             None if self.preview => {
                 empty_feed = Feed {
-                    player: String::new(),
                     combat: Arc::new(ArcSwap::from_pointee(CombatState::default())),
                     reset: Arc::new(AtomicBool::new(false)),
                 };
@@ -617,7 +615,7 @@ impl App {
                         // 1st, 10th, 100th… so stderr records the outage
                         // without becoming the outage.
                         let n = SURFACE_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
-                        if n == 1 || n % 100 == 0 {
+                        if n == 1 || n.is_multiple_of(100) {
                             eprintln!(
                                 "overlay: cannot acquire surface ({e}) — {n} consecutive \
                                  failures; window is frozen until this recovers"

@@ -364,7 +364,10 @@ impl Alerts {
     }
 
     /// Run a line as if the game had just logged it, so a trigger can be heard
-    /// before the fight that needs it.
+    /// before the fight that needs it. Exercised by the #[ignore] round-trip
+    /// tests; nothing in the UI calls it since Try-it began compiling the
+    /// draft pattern directly.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn test_line(&self, line: &str) {
         self.engine.process_line(line);
     }

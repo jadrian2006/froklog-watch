@@ -48,6 +48,16 @@ enum Tab {
 }
 
 /// One character as the tray menu needs it.
+/// Stream registration outcomes in flight: key -> Ok((id, stream, view)).
+type PendingRegs = Arc<Mutex<BTreeMap<String, Result<(String, String, String), String>>>>;
+/// A history import's live counters: (finished?, events pushed).
+type ImportProgress = (
+    Arc<std::sync::atomic::AtomicBool>,
+    Arc<std::sync::atomic::AtomicU64>,
+);
+/// Stream deletions: key -> None while running, Some(outcome) when done.
+type Deletions = Arc<Mutex<BTreeMap<String, Option<Result<(), String>>>>>;
+
 #[derive(Clone)]
 struct TrayChar {
     label: String,
@@ -222,20 +232,14 @@ struct App {
     watching: Arc<Mutex<usize>>,
     dirs_buf: String,
     /// registrations in flight, so the UI can say so and not fire twice
-    pending: Arc<Mutex<BTreeMap<String, Result<(String, String, String), String>>>>,
+    pending: PendingRegs,
     busy: Arc<Mutex<Vec<String>>>,
     /// history imports in flight: key -> (finished?, events pushed)
-    imports: BTreeMap<
-        String,
-        (
-            Arc<std::sync::atomic::AtomicBool>,
-            Arc<std::sync::atomic::AtomicU64>,
-        ),
-    >,
+    imports: BTreeMap<String, ImportProgress>,
     /// publish flips in flight: key -> the new value, or why it failed
     publishing: Arc<Mutex<BTreeMap<String, Result<bool, String>>>>,
     /// stream deletions: key -> None while running, Some(outcome) when done
-    deleting: Arc<Mutex<BTreeMap<String, Option<Result<(), String>>>>>,
+    deleting: Deletions,
     /// character whose Delete button is armed, waiting for the second click
     delete_arm: Option<String>,
     /// his trigger engine, wired to Linux audio
@@ -375,9 +379,8 @@ impl App {
 
     fn overlay_feeds(&self) -> Vec<overlay::Feed> {
         self.running
-            .iter()
-            .map(|(key, h)| overlay::Feed {
-                player: key.split('@').next().unwrap_or(key).to_string(),
+            .values()
+            .map(|h| overlay::Feed {
                 combat: Arc::clone(&h.combat),
                 reset: Arc::clone(&h.reset),
             })
@@ -589,7 +592,6 @@ impl App {
         {
             Some(f) => f,
             None if preview => overlay::Feed {
-                player: String::new(),
                 combat: Arc::new(arc_swap::ArcSwap::from_pointee(
                     froklog::state::CombatState::default(),
                 )),
@@ -876,7 +878,8 @@ impl App {
 
     /// Fold finished registrations back into the registry.
     fn collect_registrations(&mut self) {
-        let done: Vec<(String, Result<(String, String, String), String>)> = {
+        type RegOutcome = (String, Result<(String, String, String), String>);
+        let done: Vec<RegOutcome> = {
             let mut p = self.pending.lock().unwrap();
             let all = p.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             p.clear();
@@ -3074,7 +3077,13 @@ impl eframe::App for App {
                             ui.horizontal(|ui| {
                                 ui.add_space(24.0);
                                 ui.label(
-                                    egui::RichText::new(if up { "● live" } else { "○ connecting" })
+                                    egui::RichText::new(if h.local_only {
+                                        "● watching (local)"
+                                    } else if up {
+                                        "● live"
+                                    } else {
+                                        "○ connecting"
+                                    })
                                         .small()
                                         .color(if up {
                                             egui::Color32::from_rgb(120, 200, 160)
@@ -3150,7 +3159,8 @@ fn main() -> eframe::Result<()> {
 
     // Backfill the key onto streams registered before it existed. Fire and
     // forget: idempotent PATCHes with the per-stream tokens.
-    for ch in reg.characters.values().filter(|c| c.registered()).cloned() {
+    for ch in reg.characters.values().filter(|c| c.registered()) {
+        let ch = ch.clone();
         let settings = reg.settings.clone();
         rt.spawn(async move {
             let _ = engine::backfill_owner_key(&settings, &ch).await;
@@ -3172,7 +3182,7 @@ fn main() -> eframe::Result<()> {
         meter_on: Arc::clone(&meter_on),
     };
     // COSMIC hosts StatusNotifierItem, so this lands on the top bar
-    let _tray_handle = ksni::TrayService::new(tray).spawn();
+    ksni::TrayService::new(tray).spawn();
 
     // Before ANY event loop or GL context exists — see preflight_instance.
     // Only Wayland sessions use the layer-shell overlay; elsewhere the meter

@@ -169,9 +169,6 @@ pub const MAX_PICKER_ENTRIES: usize = 6;
 /// nothing — reviewing your last pulls works with no stream at all.
 #[derive(Clone)]
 pub struct FightEntry {
-    /// (mob id, first_log_ts) — ids restart after a reset, the pair does not
-    /// collide across one.
-    pub key: (u64, u32),
     pub mob_name: String,
     pub ended: std::time::Instant,
     pub duration_secs: u64,
@@ -217,7 +214,6 @@ pub fn capture_finished_fights(
         mem.insert(
             0,
             FightEntry {
-                key,
                 mob_name: m.name.clone(),
                 ended: std::time::Instant::now(),
                 duration_secs: tabs[0].elapsed_secs,
