@@ -806,20 +806,178 @@ pub fn labels(package: &str) -> Vec<String> {
 /// What is currently being said, so a later alert can interrupt it.
 static SPEAKING: Mutex<Option<std::process::Child>> = Mutex::new(None);
 
+/// How long an identical spoken text is suppressed after one starts. Two
+/// crits in one flurry say "Critical" once, not a chorus.
+const DUP_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+/// Breathing room between DIFFERENT utterances, so "Critical" and
+/// "Finishing blow" arrive as two things, not a collision.
+const UTTER_GAP: std::time::Duration = std::time::Duration::from_millis(500);
+/// A voice queue longer than this is a story about the past; drop new
+/// operational chatter instead of narrating history.
+const QUEUE_CAP: usize = 5;
+
+/// Owned form of `Voice` so a request can cross into the speaker thread.
+enum OwnedVoice {
+    SpeechDispatcher,
+    Piper(String),
+}
+
+impl OwnedVoice {
+    fn of(v: &Voice) -> Self {
+        match v {
+            Voice::SpeechDispatcher => Self::SpeechDispatcher,
+            Voice::Piper { model } => Self::Piper(model.to_string()),
+        }
+    }
+    fn as_voice(&self) -> Voice<'_> {
+        match self {
+            Self::SpeechDispatcher => Voice::SpeechDispatcher,
+            Self::Piper(m) => Voice::Piper { model: m },
+        }
+    }
+}
+
+struct SpeakReq {
+    text: String,
+    priority: VoicePriority,
+    voice: OwnedVoice,
+}
+
+/// Admission policy for the voice queue — pure, so it is testable.
+///
+/// `queued` are texts waiting to be spoken; `last_started` is when an
+/// identical text last began. Returns whether this request should join.
+fn admit(
+    text: &str,
+    priority: &VoicePriority,
+    queued: &std::collections::VecDeque<SpeakReq>,
+    last_started: Option<std::time::Instant>,
+    speaking_now: bool,
+) -> bool {
+    // Identical text recently started or already waiting: one is enough.
+    if last_started.is_some_and(|t| t.elapsed() < DUP_WINDOW) {
+        return false;
+    }
+    if queued.iter().any(|r| r.text == text) {
+        return false;
+    }
+    match priority {
+        // Trivia never queues and never talks over anything.
+        VoicePriority::Ambient => !speaking_now && queued.is_empty(),
+        VoicePriority::Emergency => true,
+        VoicePriority::Operational => queued.len() < QUEUE_CAP,
+    }
+}
+
+/// The speaker thread: one utterance at a time, a breath between them.
+///
+/// Piper is a per-utterance process with no queue of its own, so before this
+/// existed every Operational alert spawned a fresh pipeline immediately —
+/// two crits 200 ms apart talked straight over each other.
+fn speaker() -> &'static std::sync::mpsc::Sender<SpeakReq> {
+    static TX: std::sync::OnceLock<std::sync::mpsc::Sender<SpeakReq>> = std::sync::OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<SpeakReq>();
+        std::thread::Builder::new()
+            .name("voice-queue".into())
+            .spawn(move || {
+                let mut queue: std::collections::VecDeque<SpeakReq> =
+                    std::collections::VecDeque::new();
+                let mut last_started: std::collections::HashMap<String, std::time::Instant> =
+                    std::collections::HashMap::new();
+                loop {
+                    // Pull everything pending; block only when idle.
+                    if queue.is_empty() {
+                        match rx.recv() {
+                            Ok(r) => queue.push_back(r),
+                            Err(_) => return,
+                        }
+                    }
+                    while let Ok(r) = rx.try_recv() {
+                        let speaking = {
+                            let mut cur = SPEAKING.lock().unwrap();
+                            cur.as_mut()
+                                .is_some_and(|c| matches!(c.try_wait(), Ok(None)))
+                        };
+                        if admit(
+                            &r.text,
+                            &r.priority,
+                            &queue,
+                            last_started.get(&r.text).copied(),
+                            speaking,
+                        ) {
+                            if matches!(r.priority, VoicePriority::Emergency) {
+                                queue.push_front(r);
+                            } else {
+                                queue.push_back(r);
+                            }
+                        }
+                    }
+                    let Some(req) = queue.pop_front() else {
+                        continue;
+                    };
+                    last_started.insert(req.text.clone(), std::time::Instant::now());
+                    last_started.retain(|_, t| t.elapsed() < DUP_WINDOW * 4);
+                    speak_now(&req.text, &req.priority, &req.voice.as_voice());
+                    // Piper playback is awaited inside speak_now via SPEAKING;
+                    // wait for it to finish, then leave the gap.
+                    loop {
+                        let done = {
+                            let mut cur = SPEAKING.lock().unwrap();
+                            !cur.as_mut()
+                                .is_some_and(|c| matches!(c.try_wait(), Ok(None)))
+                        };
+                        if done {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    if !queue.is_empty() {
+                        std::thread::sleep(UTTER_GAP);
+                    }
+                }
+            })
+            .expect("voice-queue thread");
+        tx
+    })
+}
+
 /// Speak an alert, honouring his three priorities.
 ///
 /// Emergency cuts off whatever is talking — an alert you need now is worth
 /// losing the last one for. Ambient gives way instead: it is the trivia, and
-/// it should never talk over something that mattered. Operational just queues.
+/// it should never talk over something that mattered. Operational queues,
+/// one utterance at a time, duplicates within 2 s collapsed to one.
 pub fn speak(text: &str, priority: &VoicePriority, voice: &Voice) -> bool {
     if MUTED.load(Ordering::Relaxed) {
         return false;
     }
-    speak_forced(text, priority, voice)
+    if matches!(priority, VoicePriority::Emergency) {
+        // Interrupt NOW, from the caller's thread — the speaker thread may be
+        // mid-wait on the current utterance.
+        let mut cur = SPEAKING.lock().unwrap();
+        if let Some(c) = cur.as_mut() {
+            let _ = c.kill();
+        }
+        *cur = None;
+    }
+    speaker()
+        .send(SpeakReq {
+            text: text.to_string(),
+            priority: priority.clone(),
+            voice: OwnedVoice::of(voice),
+        })
+        .is_ok()
 }
 
-/// Speak regardless of the mute switch (auditions). Volume still applies.
+/// Speak regardless of the mute switch (auditions) — direct, unqueued: an
+/// audition should play the instant the button is clicked.
 pub fn speak_forced(text: &str, priority: &VoicePriority, voice: &Voice) -> bool {
+    speak_now(text, priority, voice)
+}
+
+/// Actually synthesize and play, immediately, on the calling thread.
+fn speak_now(text: &str, priority: &VoicePriority, voice: &Voice) -> bool {
     if text.is_empty() {
         return false;
     }
@@ -1296,5 +1454,88 @@ mod tests {
         assert_eq!(fired.len(), 2, "one overlay action and one voice action");
         assert_eq!(fired[0].message, "Zarri hailed Icestorm");
         assert_eq!(fired[1].tts_text.as_deref(), Some("Zarri is hailing you"));
+    }
+}
+
+#[cfg(test)]
+mod voice_queue_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
+
+    fn req(text: &str) -> SpeakReq {
+        SpeakReq {
+            text: text.into(),
+            priority: VoicePriority::Operational,
+            voice: OwnedVoice::SpeechDispatcher,
+        }
+    }
+
+    /// "critical | critical" collapses to one: an identical text that started
+    /// within the window, or is already waiting, is not said again.
+    #[test]
+    fn duplicates_within_the_window_collapse() {
+        let q = VecDeque::new();
+        let just_started = Some(Instant::now());
+        assert!(!admit(
+            "Critical",
+            &VoicePriority::Operational,
+            &q,
+            just_started,
+            true
+        ));
+
+        let long_ago = Some(Instant::now() - Duration::from_secs(3));
+        assert!(admit(
+            "Critical",
+            &VoicePriority::Operational,
+            &q,
+            long_ago,
+            false
+        ));
+
+        let mut q2 = VecDeque::new();
+        q2.push_back(req("Critical"));
+        assert!(
+            !admit("Critical", &VoicePriority::Operational, &q2, None, true),
+            "already queued: one is enough"
+        );
+    }
+
+    /// "critical | finishing blow" both get through — distinct texts queue,
+    /// the scheduler paces them with the gap.
+    #[test]
+    fn distinct_texts_both_queue() {
+        let mut q = VecDeque::new();
+        assert!(admit(
+            "Critical",
+            &VoicePriority::Operational,
+            &q,
+            None,
+            false
+        ));
+        q.push_back(req("Critical"));
+        assert!(admit(
+            "Finishing blow, 441",
+            &VoicePriority::Operational,
+            &q,
+            None,
+            true
+        ));
+    }
+
+    /// Ambient never talks over anything and never queues; emergency always
+    /// gets in; operational stops joining once the queue is a backlog.
+    #[test]
+    fn priorities_keep_their_meaning() {
+        let mut q = VecDeque::new();
+        assert!(!admit("trivia", &VoicePriority::Ambient, &q, None, true));
+        assert!(admit("trivia", &VoicePriority::Ambient, &q, None, false));
+
+        for i in 0..QUEUE_CAP {
+            q.push_back(req(&format!("msg {i}")));
+        }
+        assert!(!admit("late", &VoicePriority::Operational, &q, None, true));
+        assert!(admit("TRAIN", &VoicePriority::Emergency, &q, None, true));
     }
 }

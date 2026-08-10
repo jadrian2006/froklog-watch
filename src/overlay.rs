@@ -141,6 +141,9 @@ pub fn surface_height(max_rows: usize, font_size: f32) -> u32 {
     (70.0 + row * (max_rows as f32 + crate::meter_core::MAX_PICKER_ENTRIES as f32 + 2.0)) as u32
 }
 
+/// Consecutive surface-acquire failures — the frozen-overlay telltale.
+static SURFACE_FAILS: AtomicU64 = AtomicU64::new(0);
+
 const BTN_LEFT: u32 = 0x110;
 
 /// `FROKLOG_METER_DEBUG=1` prints the overlay's lifecycle to stderr — surface
@@ -591,14 +594,35 @@ impl App {
                 .update_texture(&gpu.device, &gpu.queue, *id, delta);
         }
         let frame = match gpu.surface.get_current_texture() {
-            Ok(f) => f,
+            Ok(f) => {
+                // Recovered (or healthy): say so once if we had been failing,
+                // so a stuck-then-fixed window leaves a full story in stderr.
+                let failed = SURFACE_FAILS.swap(0, Ordering::Relaxed);
+                if failed > 0 {
+                    eprintln!(
+                        "overlay: surface recovered after {failed} failed acquires \
+                         (suspend/monitor sleep?)"
+                    );
+                }
+                f
+            }
             Err(e) => {
                 mdbg!("paint: acquire failed ({e}), reconfiguring");
                 gpu.surface.configure(&gpu.device, &gpu.config);
                 match gpu.surface.get_current_texture() {
                     Ok(f) => f,
                     Err(e) => {
-                        mdbg!("paint: acquire failed twice ({e})");
+                        // ALWAYS-ON evidence: a window frozen for hours with
+                        // debug off previously left no trace at all. Log the
+                        // 1st, 10th, 100th… so stderr records the outage
+                        // without becoming the outage.
+                        let n = SURFACE_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n == 1 || n % 100 == 0 {
+                            eprintln!(
+                                "overlay: cannot acquire surface ({e}) — {n} consecutive \
+                                 failures; window is frozen until this recovers"
+                            );
+                        }
                         for id in &textures.free {
                             gpu.renderer.free_texture(id);
                         }
