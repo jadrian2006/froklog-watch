@@ -176,6 +176,25 @@ anchor, with a settle window (`drag_settle_until`) and a 4 px
 click-vs-drag threshold that replays real clicks. It works, it's ~150 lines
 of subtle state, and §9 makes all of it deletable.
 
+**The same bug reaches X11 apps through XWayland, disguised.** During a
+button-held grab COSMIC keeps delivering surface-local coordinates in the
+frame frozen at press (the non-rebasing behavior above), and XWayland
+synthesizes each X11 "root" pointer coordinate as *current window position
++ that frozen local* — so an XWayland client that moves its own window
+while polling root coordinates feeds every move back into the next reading
+and accelerates away exponentially (observed live: pointer deltas +2, +8,
++14, +23, +36… in lockstep with the window's own motion; the user saw the
+overlay "fly across all 3 screens" from a fraction-of-an-inch drag).
+Querying the pointer **relative to the dragged window** subtracts the
+current position right back out and recovers the stable frozen frame. But a
+*real* X server rebases window-relative readings after each move — opposite
+regime, opposite math — so a universal drag probes on its first move:
+issue it, read again next tick; if the reading dropped by about the move,
+you're on a rebasing server (move by remaining delta each tick), otherwise
+a frozen frame (total-delta-from-anchor). Implemented in Ryan's client as
+`overlay_shell::begin_drag`, verified live on COSMIC (frozen) with the
+rebasing path reasoned from real-X11 semantics.
+
 ## 11. Render pacing: adaptive tick
 
 No frame callbacks drive this surface — a ticker thread does. Adaptive
