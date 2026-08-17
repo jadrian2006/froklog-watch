@@ -1283,6 +1283,7 @@ dependencies = [
 [[package]]
 name = "froklog"
 version = "0.1.0"
+source = "git+https://github.com/jadrian2006/froklog?branch=sqlite-time-model#31b920ff37d2d7130973cae29ffe265fea1a36a2"
 dependencies = [
  "arc-swap",
  "axum",

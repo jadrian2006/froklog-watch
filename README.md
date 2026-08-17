@@ -15,12 +15,16 @@ and streams each one to a froklog server — plus the on-screen pieces:
 - **Local-only mode**: unregistered characters parse, meter and trigger
   without any server at all.
 
-Builds against the repo's own library (`froklog = { path = ".." }`), so the
-pair always compiles in lockstep:
+This is the **interim Linux testing client**; the cross-platform Slint
+client under joint development supersedes it. Everything learned making the
+overlay work on Wayland is written up in
+[WAYLAND-OVERLAY.md](WAYLAND-OVERLAY.md) for that conversion.
 
-    cd froklog-watch
+The froklog parsing library is a git dependency (fetched by cargo at build
+time, pinned by `Cargo.lock`) — this repo carries only the client:
+
     cargo build --release
     ./install.sh        # binary, desktop entry, hicolor icons
 
-Deliberately not part of any cargo workspace: the root crate's CI and
-Windows cross-checks are unaffected by this directory.
+Fedora RPM: `./packaging/build-rpm.sh` (Docker-based; see
+`packaging/INSTALL.md` for the user-facing install guide).

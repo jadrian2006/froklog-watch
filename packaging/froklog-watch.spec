@@ -1,6 +1,5 @@
-# Built from the froklog monorepo: the client (froklog-watch/) compiles
-# against the repo's own library (path = ".."), so the source unit for this
-# package is the WHOLE repo tree, not just the client directory.
+# Built from the standalone froklog-watch repo; the froklog library is a
+# git dependency (Cargo fetches it during build, pinned by Cargo.lock).
 %global debug_package %{nil}
 
 Name:           froklog-watch
@@ -10,8 +9,8 @@ Summary:        EverQuest log watcher with DPS meter overlay, triggers and frokl
 # Upstream has not yet chosen a license; do not redistribute beyond your
 # group until https://github.com/ryhoneyman/froklog gains a LICENSE file.
 License:        Proprietary
-URL:            https://github.com/ryhoneyman/froklog
-Source0:        froklog-src.tar
+URL:            https://github.com/jadrian2006/froklog-watch
+Source0:        froklog-watch-src.tar
 
 BuildRequires:  cargo
 BuildRequires:  rust
@@ -42,11 +41,9 @@ needs no server at all.
 %setup -q -c
 
 %build
-cd froklog-watch
 cargo build --release --locked
 
 %install
-cd froklog-watch
 install -Dm755 target/release/froklog-watch %{buildroot}%{_bindir}/froklog-watch
 install -Dm644 froklog-watch.desktop %{buildroot}%{_datadir}/applications/froklog-watch.desktop
 for size in 16 32 48 64 128 256; do
